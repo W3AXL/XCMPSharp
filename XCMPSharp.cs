@@ -1,10 +1,16 @@
 using xcmp.connection;
 
+using System.Text;
+
 namespace xcmp
 {
     public class XCMP
     {
         protected XCMPBaseConnection _connection;
+
+        public string SerialNumber { get; private set; }
+        public string ModelNumber { get; private set; }
+        public string FirmwareVersion { get; private set; }
 
         public class XcmpMessage
         {
@@ -51,7 +57,8 @@ namespace xcmp
             /// <summary>
             /// Get the XCMP message as bytes to send over a connection, including the starting length bytes
             /// </summary>
-            public byte[] Bytes { 
+            public byte[] Bytes
+            {
                 get
                 {
                     // Create the new 
@@ -75,7 +82,7 @@ namespace xcmp
                     }
                     // return the array
                     return msg;
-                } 
+                }
             }
 
             /// <summary>
@@ -102,7 +109,7 @@ namespace xcmp
                 UInt16 header = (UInt16)((data[2] << 8) + (data[3] & 0xFF));
                 MsgType = GetMsgType(header);
                 Opcode = GetOpcode(header);
-                
+
                 if (MsgType == MsgType.RESPONSE)
                 {
                     Result = (Result)data[4];
@@ -127,7 +134,8 @@ namespace xcmp
             /// <summary>
             /// The softpot operation
             /// </summary>
-            public SoftpotOperation Operation { 
+            public SoftpotOperation Operation
+            {
                 get
                 {
                     return (SoftpotOperation)Data[0];
@@ -154,7 +162,8 @@ namespace xcmp
             /// <summary>
             /// The softpot value or values as a variable-length byte array
             /// </summary>
-            public byte[] Value {  
+            public byte[] Value
+            {
                 get
                 {
                     // Return everything after the softpot oepration/type
@@ -364,7 +373,7 @@ namespace xcmp
             // Send the message
             //Console.WriteLine("XCMP: >>SNT>> " + Convert.ToHexString(message.Bytes));
             _connection.Send(message.Bytes);
-            
+
             // Get the response
             var start = DateTime.Now;
             while (DateTime.Now < start + TimeSpan.FromSeconds(timeout))
@@ -384,7 +393,7 @@ namespace xcmp
                 if (response.Opcode != message.Opcode)
                     throw new Exception($"Received different opcode from what was sent! (Sent {message.Opcode} but got {response.Opcode})");
                 // Return if everything is good
-                
+
                 return response;
             }
 
@@ -509,7 +518,7 @@ namespace xcmp
             return resp.Data.Skip(1).ToArray();
         }
 
-        public MotorolaBand[] GetBands()
+        public RadioBand[] GetBands()
         {
             Console.WriteLine($"XCMP: getting radio bands");
 
@@ -518,8 +527,8 @@ namespace xcmp
 
             XcmpMessage resp = Send(msg);
 
-            List<MotorolaBand> bands = new List<MotorolaBand>();
-            foreach(byte b in resp.Data) { bands.Add((MotorolaBand)b); }
+            List<RadioBand> bands = new List<RadioBand>();
+            foreach (byte b in resp.Data) { bands.Add((RadioBand)b); }
             return bands.ToArray();
         }
 
@@ -528,7 +537,7 @@ namespace xcmp
             Console.WriteLine($"XCMP: entering service mode");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.ENTER_TEST_MODE);
-            
+
             Send(msg);
         }
 
@@ -716,7 +725,7 @@ namespace xcmp
 
             // List
             List<byte[]> values = new List<byte[]>();
-            
+
             // Iterate
             for (int i = 0; i < n_vals; i++)
             {
@@ -769,22 +778,22 @@ namespace xcmp
             Send(msg);
         }
 
-        public void SetTransmitConfig(XCMPRadioTransmitOption option)
+        public void SetTransmitConfig(TxConfig config)
         {
-            Console.WriteLine($"XCMP: setting TX config to {Enum.GetName(option)}");
+            Console.WriteLine($"XCMP: setting TX config to {Enum.GetName(config)}");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.TRANSMIT_CONFIG);
-            msg.Data = new byte[1] { (byte)option };
+            msg.Data = new byte[1] { (byte)config };
 
             Send(msg);
         }
 
-        public void SetReceiveConfig(XCMPRadioReceiveOption option)
+        public void SetReceiveConfig(RxConfig config)
         {
-            Console.WriteLine($"XCMP: setting RX config to {Enum.GetName(option)}");
+            Console.WriteLine($"XCMP: setting RX config to {Enum.GetName(config)}");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RECEIVE_CONFIG);
-            msg.Data = new byte[1] { (byte)option };
+            msg.Data = new byte[1] { (byte)config };
 
             Send(msg);
         }

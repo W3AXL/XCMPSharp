@@ -173,7 +173,7 @@ namespace xcmp
         RDACPwrChar = 0x2F,
     }
 
-    public enum TransmitConfig : byte
+    public enum TxConfig : byte
     {
         TxPaBiasTuneMode = 1,
         HpdTxPaBiasTuneMode = 2,
@@ -207,7 +207,7 @@ namespace xcmp
         Symmetrical1031TestPattern = 119
     }
 
-    public enum ReceiveConfig : byte
+    public enum RxConfig : byte
     {
         RxAnalogCsq = 16,
         RxAnalogTpl = 19,
@@ -291,5 +291,14 @@ namespace xcmp
         SYNCED = 0x00,
         LOST = 0x01,
         NO_SYNC = 0x02
+    }
+
+    public enum RadioBand
+    {
+        BAND_VHF = 0x00,
+        BAND_UHF1 = 0x01,
+        BAND_UHF2 = 0x02,
+        BAND_7800 = 0x03,
+        BAND_900 = 0x04,
     }
 }
