@@ -6,7 +6,8 @@ namespace xcmp
     public enum MsgType : byte
     {
         REQUEST = 0x0,
-        RESPONSE = 0x8
+        RESPONSE = 0x8,
+        BROADCAST = 0xB
     }
 
     /// <summary>
@@ -45,6 +46,12 @@ namespace xcmp
         ISH_READ = 0x100,
 
         ENTER_BOOT_MODE = 0x200,
+
+        DEV_INIT_STS = 0x400,
+
+        DISPTXT = 0x401,
+
+        PING = 0x431,
     }
 
     /// <summary>
