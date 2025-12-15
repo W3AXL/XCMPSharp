@@ -99,21 +99,43 @@ namespace xcmp
         {
             /// <summary>
             /// the function that needs to be performed on the display device
+            /// Only valid for REQUEST and REPLY messages
             /// </summary>
-            public DisplayFunction Function
+            public DisplayFunction? Function
             {
-                get { return (DisplayFunction)Data[0]; }
-                set { Data[0] = (byte)value; }
+                get {
+                    if (MsgType == MsgType.BROADCAST)
+                        return null;
+                    else
+                        return (DisplayFunction)Data[0]; 
+                }
+                set {
+                    if (MsgType == MsgType.BROADCAST)
+                        return;
+                    else
+                        Data[0] = (byte)value; 
+                }
             }
 
             /// <summary>
-            /// Unique identifier for a display update request. 
+            /// Unique identifier for a display update request.
+            /// Only valid for REQUEST and REPLY messages
             /// Should be set to 0xFF for all other requests.
             /// </summary>
-            public byte Token
+            public byte? Token
             {
-                get { return Data[1]; }
-                set { Data[1] = value; }
+                get {
+                    if (MsgType == MsgType.BROADCAST)
+                        return null;
+                    else
+                        return Data[1]; 
+                }
+                set {
+                    if (MsgType == MsgType.BROADCAST)
+                        return;
+                    else
+                        Data[1] = (byte)value; 
+                }
             }
 
             /// <summary>
@@ -203,14 +225,14 @@ namespace xcmp
                 get
                 {
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
-                        return Data[4];
+                        return Data[5];
                     else
                         return null;
                 }
                 set
                 {
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
-                        Data[4] = (byte)value;
+                        Data[5] = (byte)value;
                     else
                         return;
                 }
@@ -225,14 +247,14 @@ namespace xcmp
                 get
                 {
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
-                        return (CharacterEncoding)Data[5];
+                        return (CharacterEncoding)Data[6];
                     else
                         return null;
                 }
                 set
                 {
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
-                        Data[5] = (byte)value;
+                        Data[6] = (byte)value;
                     else
                         return;
                 }
@@ -247,7 +269,25 @@ namespace xcmp
                 get
                 {
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
-                        return BitConverter.ToUInt16(Data.Skip(6).Take(2).Reverse().ToArray());
+                        return BitConverter.ToUInt16(Data.Skip(7).Take(2).Reverse().ToArray());
+                    else
+                        return null;
+                }
+            }
+
+            /// <summary>
+            /// Length of the text
+            /// Only used for update requests and query replies
+            /// </summary>
+            public UInt16? TextCharLength
+            {
+                get
+                {
+                    if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
+                        if (TextEncoding == CharacterEncoding.ISO_LATIN)
+                            return TextByteLength;
+                        else
+                            return (UInt16)(TextByteLength / 2);
                     else
                         return null;
                 }
@@ -264,9 +304,9 @@ namespace xcmp
                     if (Function == DisplayFunction.UPDATE || Function == DisplayFunction.QUERY)
                     {
                         if (TextEncoding == CharacterEncoding.ISO_LATIN)
-                            return Encoding.GetEncoding("ISO-8859-1").GetString(Data.Skip(8).ToArray());
+                            return Encoding.GetEncoding("ISO-8859-1").GetString(Data.Skip(9).ToArray());
                         else if (TextEncoding == CharacterEncoding.UCS_2)
-                            return Encoding.GetEncoding(1200).GetString(Data.Skip(8).ToArray());
+                            return Encoding.GetEncoding(1200).GetString(Data.Skip(9).ToArray());
                         else
                             throw new ArgumentException("Invalid encoding specified for text!");
                     }
@@ -286,16 +326,16 @@ namespace xcmp
                         else
                             throw new ArgumentException("Invalid encoding specified for text!");
                         // Update the length bytes
-                        Array.Copy(BitConverter.GetBytes(textBytes.Length).Reverse().ToArray(), 0, Data, 8, textBytes.Length);
+                        Array.Copy(BitConverter.GetBytes(textBytes.Length).Reverse().ToArray(), 0, Data, 9, textBytes.Length);
                         // Update the data array length
-                        if (Data.Length != textBytes.Length + 8)
+                        if (Data.Length != textBytes.Length + 9)
                         {
                             byte[] oldData = Data;
-                            Data = new byte[textBytes.Length + 8];
+                            Data = new byte[textBytes.Length + 9];
                             Array.Copy(oldData, 0, Data, 0, oldData.Length);
                         }
                         // Copy the text
-                        Array.Copy(textBytes, 0, Data, 8, textBytes.Length);
+                        Array.Copy(textBytes, 0, Data, 9, textBytes.Length);
                     }
                     else
                         return;
@@ -338,11 +378,13 @@ namespace xcmp
             /// <param name="msgBytes"></param>
             public DisplayTextMsg(byte[] msgBytes) : base(msgBytes)
             {
-                // Stub
+                // Ensure that the message type is correct
+                if (Opcode != Opcode.DISPTXT)
+                    throw new ArgumentException($"XCMP opcode {Enum.GetName(Opcode)} does not match expected DISPTXT opcode!");
             }
         }
         
-        public DisplayTextMsg GetDisplayText(DisplayRegion region, DisplayID id)
+        public DisplayTextMsg GetDisplayText(DisplayRegion region, DisplayID id = DisplayID.ALL)
         {
             // Prepare query message
             DisplayTextMsg msg = new DisplayTextMsg(MsgType.REQUEST, DisplayFunction.QUERY);
@@ -350,7 +392,9 @@ namespace xcmp
             msg.ID = id;
 
             // Send & get response
-            DisplayTextMsg resp = (DisplayTextMsg)Get(msg);
+            Send(msg);
+            // We use byte-level recieve so the XCMP decode debug print doesn't happen twice
+            DisplayTextMsg resp = new DisplayTextMsg(ReceiveBytes());
 
             Log.Debug("Got display {region} (ID {id}) text {text}", Enum.GetName((DisplayRegion)resp.Region), Enum.GetName((DisplayID)resp.ID), resp.Text);
 
