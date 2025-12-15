@@ -159,7 +159,7 @@ namespace xcmp
         public SoftpotMessage SendSoftpot(SoftpotMessage message)
         {
             // Send the softpot message and receive and standard XCMP message
-            XcmpMessage resp = Send(message);
+            XcmpMessage resp = Get(message);
             // Convert the response to a softpot message by parsing the bytes
             SoftpotMessage sp_resp = new SoftpotMessage(resp.Bytes);
             // Verify that we got the correct type back
@@ -293,7 +293,7 @@ namespace xcmp
             SoftpotMessage resp = SendSoftpot(msg);
 
             // Parse the frequencies in the response (freqs are 4 byes each)
-            int n_freqs = (resp.Length - 4) / 4;
+            int n_freqs = resp.Data.Length / 4;
             int[] freqs = new int[n_freqs];
             for (int i = 0; i < n_freqs; i++)
             {
@@ -345,7 +345,7 @@ namespace xcmp
 
             // Request an RX BER report
             msg = new XcmpMessage(MsgType.REQUEST, Opcode.RX_BER_SYNC_REPORT);
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             //System.Threading.Thread.Sleep(500);
 

@@ -350,7 +350,7 @@ namespace xcmp
             msg.ID = id;
 
             // Send & get response
-            DisplayTextMsg resp = (DisplayTextMsg)Send(msg);
+            DisplayTextMsg resp = (DisplayTextMsg)Get(msg);
 
             Log.Debug("Got display {region} (ID {id}) text {text}", Enum.GetName((DisplayRegion)resp.Region), Enum.GetName((DisplayID)resp.ID), resp.Text);
 

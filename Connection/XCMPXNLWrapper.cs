@@ -4,6 +4,7 @@ using Org.BouncyCastle.Crypto.Operators;
 using System.Net.Sockets;
 using System.Data;
 using FFmpeg.AutoGen;
+using System.Diagnostics;
 
 namespace xcmp.connection
 {
@@ -150,7 +151,7 @@ namespace xcmp.connection
             data[2] = (byte)Protocol;
             // Flags
             data[3] = (byte)(Rollover & 0b00000111);
-            data[3] += (byte)(Convert.ToByte(AckNeeded) << 3);
+            data[3] += (byte)(Convert.ToByte(!AckNeeded) << 3); // we invert here because per XNL spec, 0 = ACK required and 1 = no ACK
             // Destination Address
             Array.Copy(BitConverter.GetBytes(DstAddress).Reverse().ToArray(), 0, data, 4, 2);
             // Source Address
@@ -176,13 +177,15 @@ namespace xcmp.connection
         /// <returns></returns>
         public XNLMessage(byte[] data)
         {
+            // Log
+            //Log.Verbose("Decoding XNL message bytes: {bytes}", Convert.ToHexString(data));
             // Opcode
             Opcode = (XNLOpcode)BitConverter.ToUInt16(data.Take(2).Reverse().ToArray());
             // Protocol ID
             Protocol = (XNLProtocol)data[2];
             // Flags
             Rollover = (byte)(data[3] & 0b00000111);
-            AckNeeded = Convert.ToBoolean(data[3] >> 3 & 0x1);
+            AckNeeded = !Convert.ToBoolean(data[3] >> 3 & 0x1); // We invert here because per XNL spec, 0 = required and 1 = no ack
             // Destination Address
             DstAddress = BitConverter.ToUInt16(data.Skip(4).Take(2).Reverse().ToArray());
             // Source Address
@@ -199,12 +202,12 @@ namespace xcmp.connection
                 Array.Copy(data, 12, Payload, 0, Payload.Length);
             }
             // Check if we have any extra data
-            if (data.Length > 12 + Payload.Length)
-                Log.Warning("Extra data after end of XNL payload found! {0}", Convert.ToHexString(data.Skip(12 + Payload.Length).ToArray()));
+            if (data.Length > 12 + payloadLen)
+                Log.Warning("Extra data after end of XNL payload found! {0}", Convert.ToHexString(data.Skip(12 + payloadLen).ToArray()));
             // Debug print
             if (Payload != null)
                 Log.Verbose(
-                    "Decoded XNL message, Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, Payload Length {length}, Payload {payload}",
+                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, Payload Length {length}, Payload {payload}",
                     Enum.GetName(Opcode),
                     Enum.GetName(Protocol),
                     Rollover,
@@ -217,7 +220,7 @@ namespace xcmp.connection
                 );
             else
                 Log.Verbose(
-                    "Decoded XNL message, Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, No Payload",
+                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, No Payload",
                     Enum.GetName(Opcode),
                     Enum.GetName(Protocol),
                     Rollover,
@@ -230,7 +233,8 @@ namespace xcmp.connection
 
         public XNLMessage()
         {
-            // Stub
+            // AckNeeded defaults to true
+            AckNeeded = true;
         }
     }
 
@@ -274,9 +278,17 @@ namespace xcmp.connection
         /// </summary>
         private byte[] encryptedKey;
         /// <summary>
-        /// A 3-bit counter that increments with every message sent
+        /// A 3-bit number to identify incoming messages
         /// </summary>
-        private byte counterFlag;
+        private byte recvCounter;
+        /// <summary>
+        /// A 3 bit number to identify messages sent from this connection
+        /// </summary>
+        private byte sentCounter;
+        /// <summary>
+        /// Whether or not XCMP communication requires ACKs (this is determined at connection time)
+        /// </summary>
+        private bool ackRequired;
 
         public XCMPXNLWrapper(XCMPBaseConnection baseConnection, XNLKeys keys)
         {
@@ -296,6 +308,8 @@ namespace xcmp.connection
             authenticate();
             // Connect
             connect();
+            // Wait for device map
+            awaitSysMap();
             // We're connected, yay!
             Connected = true;
         }
@@ -315,36 +329,105 @@ namespace xcmp.connection
             conn.Dispose();
         }
 
+        /// <summary>
+        /// Send an XCMP message via the XNL data message
+        /// </summary>
+        /// <param name="data">the XCMP message as bytes</param>
+        /// <exception cref="InvalidDataException"></exception>
         public void Send(byte[] data)
         {
             // Prepare the XNL_DATA_MSG
             XNLMessage msg = new XNLMessage();
             msg.Opcode = XNLOpcode.DATA_MSG;
             msg.Protocol = XNLProtocol.XCMP;
-            msg.Rollover = counterFlag;
+            msg.Rollover = sentCounter;
             msg.TransactionID = getTID();
             msg.DstAddress = (UInt16)MasterAddr;
             msg.SrcAddress = (UInt16)SrcAddress;
             msg.Payload = data;
-            // Send and expect an ACK
-            XNLMessage resp = sendMessage(msg, XNLOpcode.DATA_MSG_ACK);
-            // Ensure our response has the same counter flag
-            if (resp.Rollover != msg.Rollover)
-                throw new InvalidDataException($"ACK for XNL data contains wrong rollover flag! Got {resp.Rollover} but sent {msg.Rollover}");
-            // Ensure our response has the same TID
-            if (resp.TransactionID != msg.TransactionID)
-                throw new InvalidDataException($"ACK for XNL data contains wrong transaction ID! Got {resp.TransactionID} but sent {msg.TransactionID}");
+            // Send
+            sendMessage(msg);
+            // Get ack if connection requires it
+            if (ackRequired)
+            {
+                XNLMessage resp = recvMessage();
+                // Ensure our response has the same counter flag
+                if (resp.Rollover != msg.Rollover)
+                    throw new InvalidDataException($"ACK for XNL data contains wrong rollover flag! Got {resp.Rollover} but sent {msg.Rollover}");
+                // Ensure our response has the same TID
+                if (resp.TransactionID != msg.TransactionID)
+                    throw new InvalidDataException($"ACK for XNL data contains wrong transaction ID! Got {resp.TransactionID} but sent {msg.TransactionID}");
+            }
             // After successful send, incremenet the counter
-            incrementFlag();
+            incrementSentCounter();
         }
 
+        /// <summary>
+        /// Receive an XCMP message via the XNL connection
+        /// </summary>
+        /// <returns>the XCMP message bytes</returns>
         public byte[] Receive()
         {
             // Receive from connection
-            byte[] respBytes = conn.Receive();
-            // Parse into message
-            XNLMessage msg = new XNLMessage(respBytes);
-            // 
+            XNLMessage msg = recvMessage();
+            // Ensure it's an XNL data message
+            if (msg.Opcode != XNLOpcode.DATA_MSG)
+                throw new InvalidDataException($"Did not receive XNL data message! (Got {Enum.GetName(msg.Opcode)})");
+            // Ensure it's an XCMP protocol message
+            if (msg.Protocol != XNLProtocol.XCMP)
+                throw new InvalidDataException($"Did not receive XNL XCMP data message! (Got {Enum.GetName(msg.Protocol)})");
+            // Send an ACK if required
+            if (ackRequired)
+            {
+                XNLMessage ack = new XNLMessage();
+                ack.Opcode = XNLOpcode.DATA_MSG_ACK;
+                ack.Protocol = XNLProtocol.XCMP;
+                // We echo the rollover counter flag and store it
+                ack.Rollover = msg.Rollover;
+                recvCounter = msg.Rollover;
+                // Addresses are reversed
+                ack.SrcAddress = msg.DstAddress;
+                ack.DstAddress = msg.SrcAddress;
+                // Send
+                sendMessage(ack);
+            }
+            // Return the XCMP message in the payload
+            return msg.Payload;
+        }
+
+        /// <summary>
+        /// Send an XNL message
+        /// </summary>
+        /// <param name="msg"></param>
+        private void sendMessage(XNLMessage msg)
+        {
+            // Debug print
+            if (msg.Payload != null)
+                Log.Verbose(
+                    "Sending XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, Payload Length {length}, Payload {payload}",
+                    Enum.GetName(msg.Opcode),
+                    Enum.GetName(msg.Protocol),
+                    msg.Rollover,
+                    msg.AckNeeded,
+                    msg.DstAddress,
+                    msg.SrcAddress,
+                    msg.TransactionID,
+                    msg.Payload.Length,
+                    Convert.ToHexString(msg.Payload)
+                );
+            else
+                Log.Verbose(
+                    "Sending XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, No Payload",
+                    Enum.GetName(msg.Opcode),
+                    Enum.GetName(msg.Protocol),
+                    msg.Rollover,
+                    msg.AckNeeded,
+                    msg.DstAddress,
+                    msg.SrcAddress,
+                    msg.TransactionID
+                );
+            // Actually send
+            conn.Send(msg.GetMsgBytes());
         }
 
         /// <summary>
@@ -353,17 +436,33 @@ namespace xcmp.connection
         /// <param name="msg"></param>
         /// <param name="expectedResponse"></param>
         /// <returns></returns>
-        private XNLMessage sendMessage(XNLMessage msg, XNLOpcode expectedResponse)
+        private XNLMessage getMessage(XNLMessage msg, XNLOpcode expectedResponse)
         {
             // Send
-            conn.Send(msg.GetMsgBytes());
+            sendMessage(msg);
             // Receive
-            byte[] resp = conn.Receive();
-            // Parse
-            XNLMessage respMsg = new XNLMessage(resp);
+            XNLMessage respMsg = recvMessage();
             // Valiate response
             if (respMsg.Opcode != expectedResponse)
                 throw new InvalidDataException($"Did not receive expected XNL response to message! {Enum.GetName(respMsg.Opcode)} != {Enum.GetName(expectedResponse)}");
+            // Return
+            return respMsg;
+        }
+
+        /// <summary>
+        /// Receive an XNL message
+        /// </summary>
+        /// <returns></returns>
+        /// <exception cref="InvalidOperationException"></exception>
+        private XNLMessage recvMessage()
+        {
+            // Ensure we have a base connection
+            if (conn == null)
+                throw new InvalidOperationException("Base XNL connection not established!");
+            // Receive bytes from the connection
+            byte[] resp = conn.Receive();
+            // Parse into an XNL message
+            XNLMessage respMsg = new XNLMessage(resp);
             // Return
             return respMsg;
         }
@@ -381,7 +480,7 @@ namespace xcmp.connection
             msg.SrcAddress =
             msg.DstAddress = 0;
             // Get a response back
-            XNLMessage masterStatusMsg = sendMessage(msg, XNLOpcode.MASTER_STATUS_BRDCST);
+            XNLMessage masterStatusMsg = getMessage(msg, XNLOpcode.MASTER_STATUS_BRDCST);
             // Parse the master status info
             UInt32 xnlVersion = BitConverter.ToUInt32(masterStatusMsg.Payload.Take(4).Reverse().ToArray());
             byte deviceType = masterStatusMsg.Payload[4];
@@ -406,7 +505,7 @@ namespace xcmp.connection
             authReq.Protocol = XNLProtocol.XNL_CTRL;
             authReq.DstAddress = (UInt16)MasterAddr;
             // Send and expect an auth reply back
-            XNLMessage authReply = sendMessage(authReq, XNLOpcode.DEVICE_AUTH_KEY_REPLY);
+            XNLMessage authReply = getMessage(authReq, XNLOpcode.DEVICE_AUTH_KEY_REPLY);
             // Get temporary source address from payload
             SrcAddress = BitConverter.ToUInt16(authReply.Payload.Take(2).Reverse().ToArray());
             // Get unencrypted auth value
@@ -443,12 +542,15 @@ namespace xcmp.connection
             // Our encrypted key string
             Array.Copy(encryptedKey, 0, req.Payload, 4, 8);
             // Send the message
-            XNLMessage reply = sendMessage(req, XNLOpcode.DEVICE_CONN_REPLY);
+            XNLMessage reply = getMessage(req, XNLOpcode.DEVICE_CONN_REPLY);
             // Ensure we got success
             if ((XNLResultCode)reply.Payload[0] != XNLResultCode.SUCCESS)
                 throw new Exception($"XNL connection request reply did not indicate success! Got {Enum.GetName((XNLResultCode)reply.Payload[0])}");
             // Parse the rest of the reply
             TIDBase = reply.Payload[1];
+            ackRequired = reply.AckNeeded;
+            if (ackRequired)
+                Log.Debug("XNL connection reply requires ACKs for XCMP");
             SrcAddress = BitConverter.ToUInt16(reply.Payload.Skip(2).Take(2).Reverse().ToArray());
             LogicalAddr = BitConverter.ToUInt16(reply.Payload.Skip(4).Take(2).Reverse().ToArray());
             byte[] enc = reply.Payload.Skip(6).Take(8).ToArray();
@@ -456,15 +558,33 @@ namespace xcmp.connection
             Log.Debug("Successfully authenticated and connected to XNL device {dstAddr:X4} (SrcAddr {src:X4}, LogicalAddr {logical:X4}, TIDBase {tid:X2}, Enc: {enc:X8})", MasterAddr, SrcAddress, LogicalAddr, TIDBase, Convert.ToHexString(enc));
         }
 
+        private void awaitSysMap(uint timeout = 5000)
+        {
+            Stopwatch sw = new Stopwatch();
+            sw.Start();
+            while (sw.ElapsedMilliseconds <= timeout)
+            {
+                XNLMessage msg = recvMessage();
+                if (msg.Opcode == XNLOpcode.DEVICE_SYSMAP_BRDCST)
+                {
+                    Log.Debug("Got XNL system map!");
+                    return;
+                }
+                Thread.Sleep(10);
+            }
+            // Throw if we didn't get our message
+            throw new TimeoutException("Did not receive XNL system map before timeout!");
+        }
+
         /// <summary>
         /// Increment the counter flag for data messages
         /// </summary>
-        private void incrementFlag()
+        private void incrementSentCounter()
         {
-            if (counterFlag == 7)
-                counterFlag = 0;
+            if (sentCounter == 7)
+                sentCounter = 0;
             else
-                counterFlag++;
+                sentCounter++;
         }
 
         /// <summary>

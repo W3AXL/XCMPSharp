@@ -4,6 +4,8 @@ using System.Text;
 using Serilog;
 using System.Linq.Expressions;
 using System.Runtime.Serialization;
+using System.Diagnostics;
+using System.Net.Sockets;
 
 namespace xcmp
 {
@@ -34,9 +36,9 @@ namespace xcmp
             /// </summary>
             public byte[] Data { get; set; }
             /// <summary>
-            /// The length of all data excluding the starting two length bytes
+            /// The length of the entire XCMP message in bytes
             /// </summary>
-            public int Length
+            public int ByteLength
             {
                 get
                 {
@@ -48,17 +50,8 @@ namespace xcmp
                 }
             }
             /// <summary>
-            /// The length of all bytes in the message, including length bytes
-            /// </summary>
-            public int ByteLength
-            {
-                get
-                {
-                    return Length + 2;
-                }
-            }
-            /// <summary>
-            /// Get the XCMP message as bytes to send over a connection, including the starting length bytes
+            /// Get the XCMP message as bytes to send over a connection
+            /// Note that some XCMP transport layers require length bytes, which are not prepended here
             /// </summary>
             public byte[] Bytes
             {
@@ -66,22 +59,19 @@ namespace xcmp
                 {
                     // Create the new 
                     byte[] msg = new byte[ByteLength];
-                    // Add length bytes
-                    msg[0] = (byte)((Length >> 8) & 0xFF);
-                    msg[1] = (byte)(Length & 0xFF);
                     // Generate Type/Opcode Header Bytes
                     byte[] header = GetTypeOpcodeHeader(MsgType, Opcode);
-                    msg[2] = header[0];
-                    msg[3] = header[1];
+                    msg[0] = header[0];
+                    msg[1] = header[1];
                     // Add optional result code and data
                     if (MsgType == MsgType.RESPONSE)
                     {
-                        msg[4] = (byte)Result;
-                        Array.Copy(Data, 0, msg, 5, Data.Length);
+                        msg[2] = (byte)Result;
+                        Array.Copy(Data, 0, msg, 3, Data.Length);
                     }
                     else
                     {
-                        Array.Copy(Data, 0, msg, 4, Data.Length);
+                        Array.Copy(Data, 0, msg, 2, Data.Length);
                     }
                     // return the array
                     return msg;
@@ -100,34 +90,26 @@ namespace xcmp
             }
 
             /// <summary>
-            /// Parse an XCMP message from a byte aray including the starting length bytes
+            /// Parse an XCMP message from a byte aray
             /// </summary>
             /// <param name="data"></param>
             public XcmpMessage(byte[] data)
             {
-                // Get length first
-                int len = (data[0] << 8) + (data[1] & 0xFF);
-                Log.Debug($"XCMP: Decoding message of length {len}");
-                // Get type & opcode next
-                UInt16 header = (UInt16)((data[2] << 8) + (data[3] & 0xFF));
+                // Get type & opcode
+                UInt16 header = (UInt16)((data[0] << 8) + (data[1] & 0xFF));
                 MsgType = GetMsgType(header);
                 Opcode = GetOpcode(header);
-
+                // Response messages have an extra byte for the result
                 if (MsgType == MsgType.RESPONSE)
                 {
-                    Result = (Result)data[4];
-                    Data = data.Skip(5).Take(len - 3).ToArray();
+                    Result = (Result)data[2];
+                    Data = data.Skip(3).ToArray();
                     Log.Debug("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Result {result:X} ({resultName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Result, Enum.GetName(Result), Convert.ToHexString(Data));
                 }
                 else
                 {
-                    Data = data.Skip(4).Take(len - 2).ToArray();
+                    Data = data.Skip(2).ToArray();
                     Log.Debug("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Convert.ToHexString(Data));
-                }
-                // Validate
-                if (Length != len)
-                {
-                    throw new Exception($"Decoded message lengths don't match (got {Length} but expected {len})");
                 }
             }
         }
@@ -200,9 +182,31 @@ namespace xcmp
         /// Connect to the attached radio
         /// </summary>
         /// <param name="underTest"></param>
-        public void Connect(bool underTest = false)
+        /// <param name="awaitInit">Wait for DEV_INIT_STS messages on connect</param>
+        public void Connect(bool underTest = false, bool waitForInit = false, int initTimeout = 5000)
         {
             _connection.Connect();
+            // Receive any messages first
+            if (waitForInit)
+            {
+                try
+                {
+                    Stopwatch sw = new Stopwatch();
+                    while (sw.ElapsedMilliseconds < initTimeout)
+                    {
+                        XcmpMessage msg = Receive();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Anything other than timeouts, pass along
+                    if (ex is TimeoutException || ex is SocketException)
+                        Log.Information("No more XCMP startup messages received");
+                    else
+                        throw;
+                }
+            }
+            // Retrieve serial/model once we're all booted up
             if (!underTest)
             {
                 SerialNumber = GetSerial();
@@ -223,24 +227,87 @@ namespace xcmp
         }
 
         /// <summary>
+        /// Send an XCMP message without expecting a response
+        /// </summary>
+        /// <param name="message"></param>
+        public void Send(XcmpMessage message)
+        {
+            SendBytes(message.Bytes);
+        }
+
+        /// <summary>
+        /// Send a raw byte sequence via the XCMP connection
+        /// </summary>
+        /// <param name="data"></param>
+        public void SendBytes(byte[] data)
+        {
+            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
+            Log.Verbose("XCMP: >>SENT>> {0}", Convert.ToHexString(data));
+            _connection.Send(data);
+        }
+
+        /// <summary>
+        /// Receive a message from the XCMP connection
+        /// </summary>
+        /// <returns></returns>
+        public XcmpMessage Receive()
+        {
+            byte[] rx = ReceiveBytes();
+            XcmpMessage response = new XcmpMessage(rx);
+            // Debug logging
+            if (response.MsgType == MsgType.RESPONSE)
+            {
+                Log.Debug(
+                    "Got XCMP Response: Opcode {opcode}, Result {result}, Data {data}",
+                    Enum.GetName(response.Opcode), Enum.GetName(response.Result), Convert.ToHexString(response.Data)
+                );
+            }
+            else if (response.MsgType == MsgType.BROADCAST)
+            {
+                Log.Debug(
+                    "Got XCMP Broadcast: Opcode {opcode}, Data {data}",
+                    Enum.GetName(response.Opcode), Convert.ToHexString(response.Data)
+                );
+            }
+            else
+            {
+                Log.Debug(
+                    "Got XCMP Message: Opcode {opcode}, Data {data}",
+                    Enum.GetName(response.Opcode), Convert.ToHexString(response.Data)
+                );
+            }
+            // Return the message we got
+            return response;
+        }
+
+        /// <summary>
+        /// Receive raw bytes from the XCMP connection
+        /// </summary>
+        /// <returns>a byte array from the connection</returns>
+        public byte[] ReceiveBytes()
+        {
+            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
+            byte[] data = _connection.Receive();
+            Log.Verbose("XCMP: <<RCV<< {0}", Convert.ToHexString(data));
+            return data;
+        }
+
+        /// <summary>
         /// Send an XCMP message and retrieve the response
         /// </summary>
         /// <param name="message">message to send</param>
         /// <param name="timeout">timeout in seconds to wait for a resposne</param>
         /// <returns></returns>
-        public XcmpMessage Send(XcmpMessage message, MsgType expectedReply = MsgType.RESPONSE)
+        public XcmpMessage Get(XcmpMessage message, MsgType expectedReply = MsgType.RESPONSE)
         {
             // Throw if not connected
             if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
 
             // Send the message
-            Log.Verbose("XCMP: >>SNT>> {0}", Convert.ToHexString(message.Bytes));
-            _connection.Send(message.Bytes);
+            Send(message);
 
-            // Get the response
-            byte[] rx = _connection.Receive();
-            XcmpMessage response = new XcmpMessage(rx);
-            Log.Verbose("XCMP: <<RCV<< {0}", Convert.ToHexString(response.Bytes));
+            // Get a response
+            XcmpMessage response = Receive();
 
             // Validate it's a response
             if (response.MsgType != expectedReply)
@@ -257,76 +324,15 @@ namespace xcmp
         }
 
         /// <summary>
-        /// Send an XCMP message without expecting a response
-        /// </summary>
-        /// <param name="message"></param>
-        public void Write(XcmpMessage message)
-        {
-            // Throw if not connected
-            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
-
-            Log.Verbose("XCMP: >>SENT>> {0}", Convert.ToHexString(message.Bytes));
-            _connection.Send(message.Bytes);
-        }
-
-        /// <summary>
-        /// Byte-Level XCMP send/receive
+        /// Byte-Level XCMP send/receive sequence
         /// </summary>
         /// <param name="data"></param>
         /// <returns></returns>
         /// <exception cref="TimeoutException"></exception>
-        public byte[] SendBytes(byte[] data)
+        public byte[] GetBytes(byte[] data)
         {
-            // Throw if not connected
-            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
-            
-            int opcodeOut = 0;
-            opcodeOut |= (data[0] << 8);
-            opcodeOut |= (data[1] & 0xFF);
-
-            // expects to get an XCMP opcode and some data in, length is auto calculated
-            byte[] toSend = new byte[data.Length + 2];
-
-            int dataLen = data.Length;
-
-            // length high and low bytes
-            toSend[0] = (byte)((dataLen >> 8) & 0xFF);
-            toSend[1] = (byte)(dataLen & 0xFF);
-
-            Array.Copy(data, 0, toSend, 2, dataLen);
-
-            Log.Verbose("XCMP: >>SNT>> {0}", Convert.ToHexString(toSend));
-
-            _connection.Send(toSend);
-
-            // start a timer so we don't hold infinitely
-            var startTime = DateTime.UtcNow;
-
-            while (DateTime.UtcNow - startTime < TimeSpan.FromSeconds(5))
-            {
-                byte[] fromRadio = _connection.Receive();
-
-                int len = 0;
-
-                len |= (fromRadio[0] << 8) & 0xFF;
-                len |= fromRadio[1];
-
-                Log.Verbose("XCMP: <<RCV<< {0}", Convert.ToHexString(fromRadio.Take(len + 2).ToArray()));
-
-                byte[] retval = new byte[len];
-
-                Array.Copy(fromRadio, 2, retval, 0, len);
-
-                int opcodeIn = 0;
-                opcodeIn |= (retval[0] << 8);
-                opcodeIn |= (retval[1] & 0xFF);
-
-                if (opcodeIn - 0x8000 == opcodeOut)
-                {
-                    return retval;
-                }
-            }
-            throw new TimeoutException("Radio did not reply in a timely manner.");
+            SendBytes(data);
+            return ReceiveBytes();
         }
 
         /// <summary>
@@ -339,7 +345,7 @@ namespace xcmp
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.SERIAL_NUMBER);
 
-            return Encoding.UTF8.GetString(Send(msg).Data).TrimEnd('\0');
+            return Encoding.UTF8.GetString(Get(msg).Data).TrimEnd('\0');
         }
 
         /// <summary>
@@ -352,7 +358,7 @@ namespace xcmp
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.MODEL_NUMBER);
 
-            return Encoding.UTF8.GetString(Send(msg).Data).TrimEnd('\0');
+            return Encoding.UTF8.GetString(Get(msg).Data).TrimEnd('\0');
         }
 
         /// <summary>
@@ -367,7 +373,7 @@ namespace xcmp
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.VERSION_INFO);
             msg.Data = new byte[] { (byte)oper };
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             return Encoding.UTF8.GetString(resp.Data).TrimEnd('\0');
         }
@@ -379,7 +385,7 @@ namespace xcmp
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RADIO_STATUS);
             msg.Data = new byte[] { (byte)oper };
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             // Verify we got the same status back
             if ((StatusOperation)resp.Data[0] != oper)
@@ -396,7 +402,7 @@ namespace xcmp
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.VERSION_INFO);
             msg.Data = new byte[] { (byte)VersionOperation.RFBand };
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             List<RadioBand> bands = new List<RadioBand>();
             foreach (byte b in resp.Data) { bands.Add((RadioBand)b); }
@@ -466,7 +472,7 @@ namespace xcmp
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.TRANSMIT);
             msg.Data = new byte[1] { (byte)microphone };
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             if (resp.Result != Result.SUCCESS)
             {
@@ -484,7 +490,7 @@ namespace xcmp
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RECEIVE);
             msg.Data = new byte[1] { (byte)RxSpeaker.InternalMuted };
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             if (resp.Result != Result.SUCCESS)
             {
@@ -531,7 +537,7 @@ namespace xcmp
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.PING);
 
-            XcmpMessage resp = Send(msg);
+            XcmpMessage resp = Get(msg);
 
             return resp.Result == Result.SUCCESS;
         }
