@@ -17,6 +17,14 @@ namespace xcmp
         public string ModelNumber { get; private set; }
         public string FirmwareVersion { get; private set; }
 
+        public int Timeout { get; private set; }
+
+        public event EventHandler<XcmpMessage> OnReceive;
+
+        public XCMPConnectionStatus Status { get { return _connection.Status; } }
+
+        private XcmpMessage lastMessage;
+
         public class XcmpMessage
         {
             /// <summary>
@@ -114,9 +122,12 @@ namespace xcmp
             }
         }
 
-        public XCMP(XCMPBaseConnection conn)
+        public XCMP(XCMPBaseConnection conn, int timeout = 1000)
         {
+            Timeout = timeout;
             _connection = conn;
+            // Bind data handler
+            _connection.OnReceive += (sender, data) => { onReceiveBytes(data); };
         }
 
         /// <summary>
@@ -183,35 +194,17 @@ namespace xcmp
         /// </summary>
         /// <param name="underTest"></param>
         /// <param name="awaitInit">Wait for DEV_INIT_STS messages on connect</param>
-        public void Connect(bool underTest = false, bool waitForInit = false, int initTimeout = 5000)
+        public async void Connect(bool underTest = false)
         {
+            // Wait for connection to complete
             _connection.Connect();
-            // Receive any messages first
-            if (waitForInit)
-            {
-                try
-                {
-                    Stopwatch sw = new Stopwatch();
-                    while (sw.ElapsedMilliseconds < initTimeout)
-                    {
-                        XcmpMessage msg = Receive();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Anything other than timeouts, pass along
-                    if (ex is TimeoutException || ex is SocketException)
-                        Log.Information("No more XCMP startup messages received");
-                    else
-                        throw;
-                }
-            }
+            while (_connection.Status != XCMPConnectionStatus.CONNECTED) { await Task.Delay(2); }
             // Retrieve serial/model once we're all booted up
             if (!underTest)
             {
-                SerialNumber = GetSerial();
-                ModelNumber = GetModel();
-                FirmwareVersion = $"HOST {GetVersion(VersionOperation.HostSoftware)}, DSP {GetVersion(VersionOperation.DSPSoftware)}";
+                SerialNumber = await GetSerial();
+                ModelNumber = await GetModel();
+                FirmwareVersion = $"HOST {await GetVersion(VersionOperation.HostSoftware)}, DSP {await GetVersion(VersionOperation.DSPSoftware)}";
                 Log.Debug("XCMP: connected to radio model {ModelNumber} (S/N {SerialNumber}, {FirmwareVersion})", ModelNumber, SerialNumber, FirmwareVersion);
             }
         }
@@ -222,7 +215,6 @@ namespace xcmp
         public void Disconnect()
         {
             _connection.Disconnect();
-
             Log.Debug("XCMP: Disconnected from radio, seeya!");
         }
 
@@ -232,133 +224,88 @@ namespace xcmp
         /// <param name="message"></param>
         public void Send(XcmpMessage message)
         {
-            SendBytes(message.Bytes);
+            sendBytes(message.Bytes);
         }
 
         /// <summary>
         /// Send a raw byte sequence via the XCMP connection
         /// </summary>
         /// <param name="data"></param>
-        public void SendBytes(byte[] data)
+        private void sendBytes(byte[] data)
         {
-            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
+            if (Status != XCMPConnectionStatus.CONNECTED) { throw new InvalidOperationException("XCMP not connected!"); }
             Log.Verbose("XCMP: >>SENT>> {0}", Convert.ToHexString(data));
             _connection.Send(data);
         }
 
-        /// <summary>
-        /// Receive a message from the XCMP connection
-        /// </summary>
-        /// <returns></returns>
-        public XcmpMessage Receive()
+        private void onReceiveBytes(byte[] data)
         {
-            byte[] rx = ReceiveBytes();
-            XcmpMessage response = new XcmpMessage(rx);
-            // Debug logging
-            if (response.MsgType == MsgType.RESPONSE)
-            {
-                Log.Debug(
-                    "Got XCMP Response: Opcode {opcode}, Result {result}, Data {data}",
-                    Enum.GetName(response.Opcode), Enum.GetName(response.Result), Convert.ToHexString(response.Data)
-                );
-            }
-            else if (response.MsgType == MsgType.BROADCAST)
-            {
-                Log.Debug(
-                    "Got XCMP Broadcast: Opcode {opcode}, Data {data}",
-                    Enum.GetName(response.Opcode), Convert.ToHexString(response.Data)
-                );
-            }
-            else
-            {
-                Log.Debug(
-                    "Got XCMP Message: Opcode {opcode}, Data {data}",
-                    Enum.GetName(response.Opcode), Convert.ToHexString(response.Data)
-                );
-            }
-            // Return the message we got
-            return response;
-        }
-
-        /// <summary>
-        /// Receive raw bytes from the XCMP connection
-        /// </summary>
-        /// <returns>a byte array from the connection</returns>
-        public byte[] ReceiveBytes()
-        {
-            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
-            byte[] data = _connection.Receive();
             Log.Verbose("XCMP: <<RCV<< {0}", Convert.ToHexString(data));
-            return data;
+            XcmpMessage msg = new XcmpMessage(data);
+            lastMessage = msg;
+            OnReceive?.Invoke(this, msg);
         }
 
         /// <summary>
-        /// Send an XCMP message and retrieve the response
+        /// Wait for a message to come over the XCMP connection with the specified opcode
         /// </summary>
-        /// <param name="message">message to send</param>
-        /// <param name="timeout">timeout in seconds to wait for a resposne</param>
+        /// <param name="opcode"></param>
         /// <returns></returns>
-        public XcmpMessage Get(XcmpMessage message, MsgType expectedReply = MsgType.RESPONSE)
+        private async Task<XcmpMessage> getMessage(Opcode opcode)
         {
-            // Throw if not connected
-            if (!_connection.Connected) { throw new InvalidOperationException("XCMP not connected!"); }
-
-            // Send the message
-            Send(message);
-
-            // Get a response
-            XcmpMessage response = Receive();
-
-            // Validate it's a response
-            if (response.MsgType != expectedReply)
-                throw new Exception($"Got unexpected reply to message! (Expected {Enum.GetName(expectedReply)} but got {Enum.GetName(response.MsgType)})");
-            // Validate it was successful
-            if (response.Result != Result.SUCCESS)
-                throw new Exception($"Response indicates {Enum.GetName(response.Result)}!");
-            // Validate it matches
-            if (response.Opcode != message.Opcode)
-                throw new Exception($"Received different opcode from what was sent! (Sent {Enum.GetName(message.Opcode)} but got {Enum.GetName(response.Opcode)})");
-            // Return if everything is good
-
-            return response;
+            Stopwatch sw = new Stopwatch();
+            while (sw.ElapsedMilliseconds < Timeout)
+            {
+                if (lastMessage?.Opcode == opcode)
+                {
+                    return lastMessage;
+                }
+                // Sleep
+                await Task.Delay(2);
+            }
+            throw new TimeoutException($"Timed out waiting for XCMP message matching opcode {opcode}");
         }
 
         /// <summary>
-        /// Byte-Level XCMP send/receive sequence
+        /// Send an XCMP message and await a response to it
         /// </summary>
-        /// <param name="data"></param>
+        /// <param name="msg">the message to send</param>
+        /// <param name="responseOpcode">The expected response's opcode</param>
         /// <returns></returns>
-        /// <exception cref="TimeoutException"></exception>
-        public byte[] GetBytes(byte[] data)
+        public async Task<XcmpMessage> Get(XcmpMessage msg, Opcode responseOpcode)
         {
-            SendBytes(data);
-            return ReceiveBytes();
+            Send(msg);
+            return await getMessage(responseOpcode);
         }
 
         /// <summary>
         /// Get the connected radio's serial number
         /// </summary>
         /// <returns></returns>
-        public string GetSerial()
+        public async Task<string> GetSerial()
         {
             Log.Debug("XCMP: getting radio serial number");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.SERIAL_NUMBER);
+            msg.Data = [0x00];  // get radio serial number
 
-            return Encoding.UTF8.GetString(Get(msg).Data).TrimEnd('\0');
+            XcmpMessage resp = await Get(msg, Opcode.SERIAL_NUMBER);
+            return Encoding.UTF8.GetString(resp.Data).TrimEnd('\0');
         }
 
         /// <summary>
         /// Get the connected radio's model number
         /// </summary>
         /// <returns></returns>
-        public string GetModel()
+        public async Task<string> GetModel()
         {
             Log.Debug("XCMP: getting radio model number");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.MODEL_NUMBER);
+            msg.Data = [0x00];  // get radio model number
 
-            return Encoding.UTF8.GetString(Get(msg).Data).TrimEnd('\0');
+            XcmpMessage resp = await Get(msg, Opcode.MODEL_NUMBER);
+            return Encoding.UTF8.GetString(resp.Data).TrimEnd('\0');
         }
 
         /// <summary>
@@ -366,26 +313,25 @@ namespace xcmp
         /// </summary>
         /// <param name="oper"></param>
         /// <returns></returns>
-        public string GetVersion(VersionOperation oper)
+        public async Task<string> GetVersion(VersionOperation oper)
         {
             Log.Debug("XCMP: getting radio version for {oper}", Enum.GetName(oper));
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.VERSION_INFO);
             msg.Data = new byte[] { (byte)oper };
 
-            XcmpMessage resp = Get(msg);
-
+            XcmpMessage resp = await Get(msg, Opcode.VERSION_INFO);
             return Encoding.UTF8.GetString(resp.Data).TrimEnd('\0');
         }
 
-        public byte[] GetStatus(StatusOperation oper)
+        public async Task<byte[]> GetStatus(StatusOperation oper)
         {
             Log.Debug("XCMP: getting radio status {oper}", Enum.GetName(oper));
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RADIO_STATUS);
             msg.Data = new byte[] { (byte)oper };
 
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.RADIO_STATUS);
 
             // Verify we got the same status back
             if ((StatusOperation)resp.Data[0] != oper)
@@ -395,14 +341,14 @@ namespace xcmp
             return resp.Data.Skip(1).ToArray();
         }
 
-        public RadioBand[] GetBands()
+        public async Task<RadioBand[]> GetBands()
         {
             Log.Debug("XCMP: getting radio bands");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.VERSION_INFO);
             msg.Data = new byte[] { (byte)VersionOperation.RFBand };
 
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.VERSION_INFO);
 
             List<RadioBand> bands = new List<RadioBand>();
             foreach (byte b in resp.Data) { bands.Add((RadioBand)b); }
@@ -465,14 +411,14 @@ namespace xcmp
             Send(msg);
         }
 
-        public bool Keyup(TxMicrophone microphone = TxMicrophone.ExternalMuted)
+        public async Task<bool> Keyup(TxMicrophone microphone = TxMicrophone.ExternalMuted)
         {
             Log.Debug("XCMP: keying radio");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.TRANSMIT);
             msg.Data = new byte[1] { (byte)microphone };
 
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.TRANSMIT);
 
             if (resp.Result != Result.SUCCESS)
             {
@@ -483,14 +429,14 @@ namespace xcmp
                 return true;
         }
 
-        public bool Dekey()
+        public async Task<bool> Dekey()
         {
             Log.Debug("XCMP: dekeying radio");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RECEIVE);
             msg.Data = new byte[1] { (byte)RxSpeaker.InternalMuted };
 
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.RECEIVE);
 
             if (resp.Result != Result.SUCCESS)
             {
@@ -531,16 +477,32 @@ namespace xcmp
             Send(msg);
         }
 
-        public bool Ping()
+        public async Task<bool> Ping()
         {
             Log.Debug("XCMP: pinging radio");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.PING);
 
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.PING);
 
             return resp.Result == Result.SUCCESS;
         }
+        /// <summary>
+        /// Change the channel on the radio
+        /// </summary>
+        /// <param name="down">true to decrement the selected channel</param>
+        /// <param name="step">number of channels to move per step</param>
+        /// <returns></returns>
+        public async Task<bool> ChangeChannel(bool down = false, UInt16 step = 1)
+        {
+            Log.Debug("XCMP: Moving {step} channels {dir}", step, down ? "down": "up");
 
+            ChanZoneSelectMsg msg = new ChanZoneSelectMsg(MsgType.REQUEST, down ? ChanZoneSelFunction.CHAN_DECREMENT : ChanZoneSelFunction.CHAN_INCREMENT);
+            msg.ChanNumber = 1;
+
+            XcmpMessage resp = await Get(msg, Opcode.CHZNSEL);
+
+            return resp.Result == Result.SUCCESS;
+        }
     }
 }

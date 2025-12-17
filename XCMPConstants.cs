@@ -51,6 +51,8 @@ namespace xcmp
 
         DISPTXT = 0x401,
 
+        CHZNSEL = 0x40D,
+
         PING = 0x431,
     }
 

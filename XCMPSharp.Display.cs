@@ -1,3 +1,4 @@
+using System.CommandLine.Parsing;
 using System.Drawing;
 using System.Text;
 using FFmpeg.AutoGen;
@@ -382,9 +383,23 @@ namespace xcmp
                 if (Opcode != Opcode.DISPTXT)
                     throw new ArgumentException($"XCMP opcode {Enum.GetName(Opcode)} does not match expected DISPTXT opcode!");
             }
+
+            /// <summary>
+            /// Cast a base XCMP message to a DISPTXT message
+            /// </summary>
+            /// <param name="msg"></param>
+            public DisplayTextMsg(XcmpMessage msg) : base(msg.MsgType, msg.Opcode)
+            {
+                // Sanity Check
+                if (msg.Opcode != Opcode.DISPTXT)
+                    throw new ArgumentException($"Cannot cast XCMP message with opcode {Enum.GetName(Opcode)} to a DISPTXT message!");
+                // Copy things over
+                Result = msg.Result;
+                Data = msg.Data;
+            }
         }
         
-        public DisplayTextMsg GetDisplayText(DisplayRegion region, DisplayID id = DisplayID.ALL)
+        public async Task<DisplayTextMsg> GetDisplayText(DisplayRegion region, DisplayID id = DisplayID.ALL)
         {
             // Prepare query message
             DisplayTextMsg msg = new DisplayTextMsg(MsgType.REQUEST, DisplayFunction.QUERY);
@@ -392,9 +407,7 @@ namespace xcmp
             msg.ID = id;
 
             // Send & get response
-            Send(msg);
-            // We use byte-level recieve so the XCMP decode debug print doesn't happen twice
-            DisplayTextMsg resp = new DisplayTextMsg(ReceiveBytes());
+            DisplayTextMsg resp = new DisplayTextMsg(await Get(msg, Opcode.DISPTXT));
 
             Log.Debug("Got display {region} (ID {id}) text {text}", Enum.GetName((DisplayRegion)resp.Region), Enum.GetName((DisplayID)resp.ID), resp.Text);
 

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using Org.BouncyCastle.Crypto;
+using Serilog;
 
 namespace xcmp.connection
 {
@@ -19,14 +20,19 @@ namespace xcmp.connection
         private UdpClient udpClient;
         private IPEndPoint udpEndpoint;
         private IPConnectionType ipType;
-        public bool Connected { get; private set; }
+        private CancellationTokenSource ts;
+        private CancellationToken ct;
+        public XCMPConnectionStatus Status { get; private set; }
+        public event EventHandler<byte[]> OnReceive;
+        public int Timeout { get; private set; }
         
-        public XCMPIPConnection(string remoteAddress, int remotePort, IPConnectionType connectionType)
+        public XCMPIPConnection(string remoteAddress, int remotePort, IPConnectionType connectionType, int timeout = 1000)
         {
             this.remoteAddress = remoteAddress;
             this.remotePort = remotePort;
             this.ipType = connectionType;
-            Connected = false;
+            this.Timeout = timeout;
+            Status = XCMPConnectionStatus.DISCONNECTED;
         }
 
         public void Dispose()
@@ -39,41 +45,66 @@ namespace xcmp.connection
 
         public void Connect()
         {
+            Status = XCMPConnectionStatus.CONNECTING;
+
             if (ipType == IPConnectionType.TCP)
             {
                 tcpClient = new TcpClient(remoteAddress, remotePort);
-                tcpClient.ReceiveTimeout = 1000;
                 tcpStream = tcpClient.GetStream();
             }
             else
             {
                 udpClient = new UdpClient(remotePort);
-                udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, 1000);
                 udpClient.Connect(remoteAddress, remotePort);
                 udpEndpoint = new IPEndPoint(IPAddress.Parse(remoteAddress), remotePort);
             }
-            Connected = true;
+            // Start receiver thread
+            ts = new CancellationTokenSource();
+            ct = ts.Token;
+            Task.Run(() => listen(ct), ct);
+            // We are connected
+            Status = XCMPConnectionStatus.CONNECTED;
         }
 
         public void Disconnect()
         {
+            Status = XCMPConnectionStatus.DISCONNECTING;
+            // Stop listen task
+            ts?.Cancel();
+            ts?.Dispose();
+            ts = null;
+            // Close connections
             tcpStream?.Close();
             tcpClient?.Close();
             udpClient?.Close();
-            Connected = false;
+            // Done
+            Status = XCMPConnectionStatus.DISCONNECTED;
         }
 
-        public byte[] Receive()
+        private async Task listen(CancellationToken token)
         {
-            if (ipType == IPConnectionType.TCP)
+
+            byte[] rxBuffer = new byte[1024];
+
+            while (!token.IsCancellationRequested)
             {
-                byte[] data = new byte[1024];
-                int bytesRead = tcpStream.Read(data);
-                return data.Take(bytesRead).ToArray();
-            }
-            else
-            {
-                return udpClient.Receive(ref udpEndpoint);
+                try
+                {
+                    if (ipType == IPConnectionType.TCP)
+                    {
+                        int bytesRead = await tcpStream.ReadAsync(rxBuffer, token);
+                        OnReceive?.Invoke(this, rxBuffer.Take(bytesRead).ToArray());
+                    }
+                    else
+                    {
+                        UdpReceiveResult result = await udpClient.ReceiveAsync(token);
+                        OnReceive?.Invoke(this, result.Buffer);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Debug("Stopping XCMP IP listener");
+                }
             }
         }
 

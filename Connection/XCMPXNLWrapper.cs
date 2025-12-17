@@ -271,7 +271,11 @@ namespace xcmp.connection
         /// </summary>
         public UInt16 LogicalAddr { get; private set; }
 
-        public bool Connected { get; private set; }
+        public XCMPConnectionStatus Status { get; private set; }
+
+        public event EventHandler<byte[]> OnReceive;
+
+        public int Timeout { get; private set; }
 
         /// <summary>
         /// The encrypted plaintext value obtained after authentication
@@ -289,38 +293,49 @@ namespace xcmp.connection
         /// Whether or not XCMP communication requires ACKs (this is determined at connection time)
         /// </summary>
         private bool ackRequired;
+        /// <summary>
+        /// Storage for the last message received by the XNL connection (used for async transactions)
+        /// </summary>
+        private XNLMessage lastMessage;
 
-        public XCMPXNLWrapper(XCMPBaseConnection baseConnection, XNLKeys keys)
+        public XCMPXNLWrapper(XCMPBaseConnection baseConnection, XNLKeys keys, int timeout = 1000)
         {
             conn = baseConnection;
             this.keys = keys;
             SrcAddress = null;
             MasterAddr = null;
+            Timeout = timeout;
+            // Bind the connection receive event
+            conn.OnReceive += receiveHandler;
         }
 
         public void Connect()
         {
+            Status = XCMPConnectionStatus.CONNECTING;
             // Start the base connection
             conn.Connect();
             // Query for master
-            getMaster();
-            // Authenticate
-            authenticate();
-            // Connect
-            connect();
-            // Wait for device map
-            awaitSysMap();
-            // We're connected, yay!
-            Connected = true;
+            queryMaster();
+            // The rest of the connection setup is handled 
+        }
+
+        /// <summary>
+        /// Waits for the connection sequence to complete
+        /// </summary>
+        public async void AwaitConnect()
+        {
+            while (Status != XCMPConnectionStatus.CONNECTED)
+                await Task.Delay(10);
         }
 
         public void Disconnect()
         {
+            Status = XCMPConnectionStatus.DISCONNECTING;
             // TODO: XNL disconnect
             // Disconnect from the base connection
             conn.Disconnect();
             // We're disconnected
-            Connected = false;
+            Status = XCMPConnectionStatus.DISCONNECTED;
         }
 
         public void Dispose()
@@ -334,7 +349,7 @@ namespace xcmp.connection
         /// </summary>
         /// <param name="data">the XCMP message as bytes</param>
         /// <exception cref="InvalidDataException"></exception>
-        public void Send(byte[] data)
+        public async void Send(byte[] data)
         {
             // Prepare the XNL_DATA_MSG
             XNLMessage msg = new XNLMessage();
@@ -350,7 +365,8 @@ namespace xcmp.connection
             // Get ack if connection requires it
             if (ackRequired)
             {
-                XNLMessage resp = recvMessage();
+                // TODO: Await a DATA_MSG_ACK response to our transaction ID
+                XNLMessage resp = await getResponse(XNLOpcode.DATA_MSG_ACK, msg.TransactionID);
                 // Ensure our response has the same counter flag
                 if (resp.Rollover != msg.Rollover)
                     throw new InvalidDataException($"ACK for XNL data contains wrong rollover flag! Got {resp.Rollover} but sent {msg.Rollover}");
@@ -363,19 +379,81 @@ namespace xcmp.connection
         }
 
         /// <summary>
+        /// Wait for a response to a message using the message's transaction ID
+        /// </summary>
+        /// <param name="transactionID"></param>
+        /// <returns></returns>
+        private async Task<XNLMessage> getResponse(XNLOpcode opcode, UInt16 transactionID)
+        {
+            Stopwatch sw = new Stopwatch();
+            while (sw.ElapsedMilliseconds < Timeout)
+            {
+                if (lastMessage?.Opcode == opcode && lastMessage?.TransactionID == transactionID)
+                {
+                    return lastMessage;
+                }
+                // Sleep
+                await Task.Delay(2);
+            }
+            throw new TimeoutException($"Timed out waiting for response matching opcode {Enum.GetName(opcode)} and TID {transactionID}");
+        }
+
+        /// <summary>
+        /// Handler for the lower-level network socket receive data event
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="data"></param>
+        private void receiveHandler(object sender, byte[] data)
+        {
+            // Decode
+            XNLMessage msg = new XNLMessage(data);
+            // Store
+            lastMessage = msg;
+            // Switch based on message type
+            switch (msg.Opcode)
+            {
+                // Master Status Broadcast is sent in response to a Master Query
+                case XNLOpcode.MASTER_STATUS_BRDCST:
+                    gotMasterStatus(msg);
+                    break;
+                // Auth Key Reply is sent in response to an Auth Key Request
+                case XNLOpcode.DEVICE_AUTH_KEY_REPLY:
+                    gotAuthKeyReply(msg);
+                    break;
+                // Connection Reply is sent in response to a Connection Request
+                case XNLOpcode.DEVICE_CONN_REPLY:
+                    gotConnReply(msg);
+                    break;
+                // XCMP Data Message encapsulates XCMP data from the device
+                case XNLOpcode.DATA_MSG:
+                    gotXcmpData(msg);
+                    break;
+                // XCMP Data ACK acknowledges a previous XCMP data message
+                case XNLOpcode.DATA_MSG_ACK:
+                    // TODO: Search through our list of messages pending acks
+                    break;
+                // Handle anything else
+                default:
+                    Log.Warning("Unhandled XNL message opcode {opcode}", msg.Opcode);
+                    break;
+            }
+        }
+
+        /// <summary>
         /// Receive an XCMP message via the XNL connection
         /// </summary>
         /// <returns>the XCMP message bytes</returns>
-        public byte[] Receive()
+        private void gotXcmpData(XNLMessage msg)
         {
-            // Receive from connection
-            XNLMessage msg = recvMessage();
-            // Ensure it's an XNL data message
-            if (msg.Opcode != XNLOpcode.DATA_MSG)
-                throw new InvalidDataException($"Did not receive XNL data message! (Got {Enum.GetName(msg.Opcode)})");
             // Ensure it's an XCMP protocol message
             if (msg.Protocol != XNLProtocol.XCMP)
                 throw new InvalidDataException($"Did not receive XNL XCMP data message! (Got {Enum.GetName(msg.Protocol)})");
+            // If it's not addressed to us and not a broadcast, ignore it
+            if (msg.DstAddress != SrcAddress && msg.DstAddress != 0)
+            {
+                Log.Warning("Ignoring XNL message sent to address {addr}, not us {us}", msg.DstAddress, SrcAddress);
+                return;
+            }
             // Send an ACK if required
             if (ackRequired)
             {
@@ -388,11 +466,13 @@ namespace xcmp.connection
                 // Addresses are reversed
                 ack.SrcAddress = msg.DstAddress;
                 ack.DstAddress = msg.SrcAddress;
+                // Echo transaction ID
+                ack.TransactionID = msg.TransactionID;
                 // Send
                 sendMessage(ack);
             }
-            // Return the XCMP message in the payload
-            return msg.Payload;
+            // Call our higher-level receive event
+            OnReceive?.Invoke(this, msg.Payload);
         }
 
         /// <summary>
@@ -431,47 +511,10 @@ namespace xcmp.connection
         }
 
         /// <summary>
-        /// Send an XNL message and expect a reply
-        /// </summary>
-        /// <param name="msg"></param>
-        /// <param name="expectedResponse"></param>
-        /// <returns></returns>
-        private XNLMessage getMessage(XNLMessage msg, XNLOpcode expectedResponse)
-        {
-            // Send
-            sendMessage(msg);
-            // Receive
-            XNLMessage respMsg = recvMessage();
-            // Valiate response
-            if (respMsg.Opcode != expectedResponse)
-                throw new InvalidDataException($"Did not receive expected XNL response to message! {Enum.GetName(respMsg.Opcode)} != {Enum.GetName(expectedResponse)}");
-            // Return
-            return respMsg;
-        }
-
-        /// <summary>
-        /// Receive an XNL message
-        /// </summary>
-        /// <returns></returns>
-        /// <exception cref="InvalidOperationException"></exception>
-        private XNLMessage recvMessage()
-        {
-            // Ensure we have a base connection
-            if (conn == null)
-                throw new InvalidOperationException("Base XNL connection not established!");
-            // Receive bytes from the connection
-            byte[] resp = conn.Receive();
-            // Parse into an XNL message
-            XNLMessage respMsg = new XNLMessage(resp);
-            // Return
-            return respMsg;
-        }
-
-        /// <summary>
-        /// Routine for verifying connection to a master via XNL
+        /// Sends a new XNL master query
         /// </summary>
         /// <exception cref="ArgumentException"></exception>
-        private void getMaster()
+        private void queryMaster()
         {
             Log.Debug("Querying for XNL master...");
             XNLMessage msg = new XNLMessage();
@@ -479,22 +522,33 @@ namespace xcmp.connection
             msg.Protocol = XNLProtocol.XNL_CTRL;
             msg.SrcAddress =
             msg.DstAddress = 0;
-            // Get a response back
-            XNLMessage masterStatusMsg = getMessage(msg, XNLOpcode.MASTER_STATUS_BRDCST);
-            // Parse the master status info
-            UInt32 xnlVersion = BitConverter.ToUInt32(masterStatusMsg.Payload.Take(4).Reverse().ToArray());
-            byte deviceType = masterStatusMsg.Payload[4];
-            byte deviceNumber = masterStatusMsg.Payload[5];
-            bool dataMsgSent = Convert.ToBoolean(masterStatusMsg.Payload[6]);
-            MasterAddr = masterStatusMsg.SrcAddress;
-            Log.Debug("XNL found master at address {addr:X4} using XNL version {ver:X4} (Device Type {type:X2}, Device Number {num:X2})", MasterAddr, xnlVersion, deviceType, deviceNumber);
+            sendMessage(msg);
+        }
+
+        /// <summary>
+        /// Parse a master status broadcast
+        /// </summary>
+        /// <param name="masterStatusMsg"></param>
+        private void gotMasterStatus(XNLMessage masterStatusMsg)
+        {
+            // If we're not connected, we should parse the master info and move on to authenticating
+            if (Status != XCMPConnectionStatus.CONNECTED)
+            {
+                UInt32 xnlVersion = BitConverter.ToUInt32(masterStatusMsg.Payload.Take(4).Reverse().ToArray());
+                byte deviceType = masterStatusMsg.Payload[4];
+                byte deviceNumber = masterStatusMsg.Payload[5];
+                bool dataMsgSent = Convert.ToBoolean(masterStatusMsg.Payload[6]);
+                MasterAddr = masterStatusMsg.SrcAddress;
+                Log.Debug("XNL found master at address {addr:X4} using XNL version {ver:X4} (Device Type {type:X2}, Device Number {num:X2})", MasterAddr, xnlVersion, deviceType, deviceNumber);
+                sendAuthRequest();
+            }
         }
 
         /// <summary>
         /// Routine for authenticating with an XNL master
         /// </summary>
         /// <exception cref="ArgumentException"></exception>
-        private void authenticate()
+        private void sendAuthRequest()
         {
             // Throw exception if we haven't connected
             if (MasterAddr == null)
@@ -504,8 +558,12 @@ namespace xcmp.connection
             authReq.Opcode = XNLOpcode.DEVICE_AUTH_KEY_REQUEST;
             authReq.Protocol = XNLProtocol.XNL_CTRL;
             authReq.DstAddress = (UInt16)MasterAddr;
-            // Send and expect an auth reply back
-            XNLMessage authReply = getMessage(authReq, XNLOpcode.DEVICE_AUTH_KEY_REPLY);
+            // Send
+            sendMessage(authReq);
+        }
+
+        private void gotAuthKeyReply(XNLMessage authReply)
+        {
             // Get temporary source address from payload
             SrcAddress = BitConverter.ToUInt16(authReply.Payload.Take(2).Reverse().ToArray());
             // Get unencrypted auth value
@@ -517,12 +575,14 @@ namespace xcmp.connection
                 Convert.ToHexString(encryptedKey),
                 Convert.ToHexString(plaintext)
             );
+            // Send the final connection request
+            sendConnRequest();
         }
 
         /// <summary>
-        /// Routine for connecting to an XNL master after authentication
+        /// Routine for sending an XNL connection request
         /// </summary>
-        private void connect()
+        private void sendConnRequest()
         {
             // Throw exception if we haven't authenticated
             if (encryptedKey == null)
@@ -542,10 +602,17 @@ namespace xcmp.connection
             // Our encrypted key string
             Array.Copy(encryptedKey, 0, req.Payload, 4, 8);
             // Send the message
-            XNLMessage reply = getMessage(req, XNLOpcode.DEVICE_CONN_REPLY);
+            sendMessage(req);
+        }
+
+        private void gotConnReply(XNLMessage reply)
+        {
             // Ensure we got success
             if ((XNLResultCode)reply.Payload[0] != XNLResultCode.SUCCESS)
+            {
+                Status = XCMPConnectionStatus.ERROR;
                 throw new Exception($"XNL connection request reply did not indicate success! Got {Enum.GetName((XNLResultCode)reply.Payload[0])}");
+            }
             // Parse the rest of the reply
             TIDBase = reply.Payload[1];
             ackRequired = reply.AckNeeded;
@@ -555,25 +622,11 @@ namespace xcmp.connection
             LogicalAddr = BitConverter.ToUInt16(reply.Payload.Skip(4).Take(2).Reverse().ToArray());
             byte[] enc = reply.Payload.Skip(6).Take(8).ToArray();
             // We're connected, yay!
-            Log.Debug("Successfully authenticated and connected to XNL device {dstAddr:X4} (SrcAddr {src:X4}, LogicalAddr {logical:X4}, TIDBase {tid:X2}, Enc: {enc:X8})", MasterAddr, SrcAddress, LogicalAddr, TIDBase, Convert.ToHexString(enc));
-        }
-
-        private void awaitSysMap(uint timeout = 5000)
-        {
-            Stopwatch sw = new Stopwatch();
-            sw.Start();
-            while (sw.ElapsedMilliseconds <= timeout)
-            {
-                XNLMessage msg = recvMessage();
-                if (msg.Opcode == XNLOpcode.DEVICE_SYSMAP_BRDCST)
-                {
-                    Log.Debug("Got XNL system map!");
-                    return;
-                }
-                Thread.Sleep(10);
-            }
-            // Throw if we didn't get our message
-            throw new TimeoutException("Did not receive XNL system map before timeout!");
+            Log.Debug(
+                "Successfully authenticated and connected to XNL device {dstAddr:X4} (SrcAddr {src:X4}, LogicalAddr {logical:X4}, TIDBase {tid:X2}, Enc: {enc:X8})",
+                MasterAddr, SrcAddress, LogicalAddr, TIDBase, Convert.ToHexString(enc)
+            );
+            Status = XCMPConnectionStatus.CONNECTED;
         }
 
         /// <summary>

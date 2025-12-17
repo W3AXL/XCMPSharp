@@ -18,6 +18,10 @@ namespace xcmp.connection
         /// </summary>
         private int serialBaud;
         /// <summary>
+        /// The serial port object, used for direct control
+        /// </summary>
+        private SerialPort port;
+        /// <summary>
         /// 
         /// </summary>
         private string pppdPath;
@@ -26,9 +30,9 @@ namespace xcmp.connection
         /// </summary>
         private Process pppd;
 
-        public bool Connected { get { return pppdConnected; } }
-        
-        private bool pppdConnected;
+        public XCMPConnectionStatus Status { get; private set; }
+        public event EventHandler<byte[]> OnReceive;
+        public int Timeout { get; private set; }
         /// <summary>
         /// Remote radio IP address obtained during ppp connection
         /// </summary>
@@ -45,17 +49,81 @@ namespace xcmp.connection
         /// Once we have our PPP connection started, we use the XCMP IP classes for everything else (can be TCP or UDP)
         /// </summary>
         private XCMPBaseConnection xcmpConn;
+        /// <summary>
+        /// List of baudrates for port auto-baudrate detection
+        /// </summary>
+        public static List<int> BaudRates = [
+            9600,
+            19200,
+            38400,
+            57600,
+            115200
+        ];
 
         // Create a new XCMP connection using the specified serial port and a PPP connection
-        public XCMPPPPConnection(string serialPort, int serialBaud, string pppdPath, IPConnectionType type, int remotePort)
+        public XCMPPPPConnection(string serialPort, int serialBaud, string pppdPath, IPConnectionType type, int remotePort, int timeout = 1000)
         {
             this.serialPort = serialPort;
             this.serialBaud = serialBaud;
             this.pppdPath = pppdPath;
             this.connType = type;
             this.connPort = remotePort;
+            this.Timeout = timeout;
+
+            Status = XCMPConnectionStatus.DISCONNECTED;
             
             Log.Debug("Created new XCMP PPP connection to {0} at {1} baud with pppd {2} using {3}/{4}", this.serialPort, this.serialBaud, this.pppdPath, connPort, Enum.GetName(connType));
+        }
+
+        /// <summary>
+        /// Read a line from the serial port, ignoring empty lines
+        /// </summary>
+        /// <param name="port"></param>
+        /// <returns></returns>
+        private string readLine(SerialPort port)
+        {
+            string resp = port.ReadLine().Trim();
+            if (string.IsNullOrWhiteSpace(resp)) { resp = port.ReadLine().Trim(); }
+            Log.Verbose("[{0}] << {1}", port.PortName, resp);
+            return resp;
+        }
+
+        /// <summary>
+        /// Write a line to the serial port
+        /// </summary>
+        /// <param name="port"></param>
+        /// <param name="msg"></param>
+        private void writeLine(SerialPort port, string msg)
+        {
+            port.WriteLine(msg);
+            Log.Verbose("[{0}] >> {1}", port.PortName, msg);
+        }
+
+        /// <summary>
+        /// Check for the correct baudrate using AT
+        /// </summary>
+        /// <param name="port"></param>
+        /// <param name="baudrate"></param>
+        /// <returns></returns>
+        private bool checkBaud(SerialPort port, int baudrate)
+        {
+            if (port.IsOpen)
+                port.Close();
+            port.BaudRate = baudrate;
+            port.Open();
+            try
+            {
+                writeLine(port, "AT");
+                string resp = readLine(port);
+                // When detecting baudrates you sometimes get an ERROR response, this is still valid
+                if (resp == "OK" || resp == "ERROR")
+                    return true;
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
+            return false;
         }
 
         /// <summary>
@@ -63,34 +131,51 @@ namespace xcmp.connection
         /// </summary>
         private void dialModem()
         {
-            // Create a new serial port
-            SerialPort port = new SerialPort(serialPort);
-            port.BaudRate = serialBaud;
+            // Create a new serial port, starting at 9600 baud
+            port = new SerialPort(serialPort);
+            port.BaudRate = 9600;
             port.NewLine = "\r";
             port.ReadTimeout = 500;
             port.WriteTimeout = 500;
             // Open it
             Log.Debug("Opening XCMP serial port {0} for PPP dialing", serialPort);
-            port.Open();
-            // Verify connection
-            port.WriteLine("ATZ");
-            Log.Verbose("[{0}] >> {1}", serialPort, "ATZ");
-            string resp = port.ReadLine().Trim();
-            // Read again if string blank
-            if (string.IsNullOrWhiteSpace(resp)) { resp = port.ReadLine().Trim(); }
-            Log.Verbose("[{0}] << {1}", serialPort, resp);
-            if (resp != "OK")
+            string resp;
+            // Check if we're at 9600 baud first or another baudrate
+            bool established = false;
+            foreach (int baud in BaudRates)
             {
-                Log.Error("Expected OK from ATZ but got {0}", resp);
-                throw new Exception("Failed to connect to XCMP modem!");
+                if (checkBaud(port, baud))
+                {
+                    if (baud != serialBaud)
+                    {
+                        // Change baudrate to new desired rate
+                        Log.Debug("Switching serial connection to {baud} baud", serialBaud);
+                        writeLine(port, $"AT+IPR={serialBaud}");
+                        resp = readLine(port);
+                        if (resp != "OK")
+                        {
+                            Log.Error("Failed to change baudrate to {baud}, radio reports {msg}", serialBaud, resp);
+                            throw new Exception($"Failed to change baudrate to {serialBaud}, radio reports {resp}");
+                        }
+                        established = true;
+                        break;
+                    }
+                    else
+                        established = true;
+                        break;
+                }
+            };
+            // Verify the baudrate was detected
+            if (!established)
+            {
+                Log.Error("Failed to establish connection to radio at any valid baudrate!", serialBaud);
+                throw new Exception($"Failed to establish connection to radio at any valid baudrate!");
             }
+            // Print success
+            Log.Information("Connected to radio at {baud} baud", serialBaud);
             // Dial
-            port.WriteLine("ATDT8002");
-            Log.Verbose("[{0}] >> {1}", serialPort, "ATDT8002");
-            resp = port.ReadLine().Trim();
-            // Read again if string blank
-            if (string.IsNullOrWhiteSpace(resp)) { resp = port.ReadLine().Trim(); }
-            Log.Verbose("[{0}] << {1}", serialPort, resp);
+            writeLine(port, "ATDT8002");
+            resp = readLine(port);
             if (resp != "CONNECT")
             {
                 Log.Error("Failed to CONNECT after dial, got {0}", resp);
@@ -138,11 +223,11 @@ namespace xcmp.connection
             // Wait for connection
             Stopwatch sw = Stopwatch.StartNew();
             Log.Information("Connecting to XCMP radio at {0}", serialPort);
-            while (!pppdConnected && sw.Elapsed < TimeSpan.FromSeconds(5))
+            while (Status != XCMPConnectionStatus.CONNECTED && sw.Elapsed < TimeSpan.FromSeconds(5))
             {
                 Thread.Sleep(10);
             }
-            if (!pppdConnected)
+            if (Status != XCMPConnectionStatus.CONNECTED)
             {
                 Log.Error("Timed out waiting for pppd connection!");
                 throw new TimeoutException("Timed out waiting for ppp connection");
@@ -156,6 +241,7 @@ namespace xcmp.connection
 
         public void Connect()
         {
+            Status = XCMPConnectionStatus.CONNECTING;
             // On Linux, we use wvdial/pppd
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
@@ -165,6 +251,8 @@ namespace xcmp.connection
                 startPppd();
                 // Create a new XCMP IP connection depending on connection type
                 xcmpConn = new XCMPIPConnection(pppdRemoteIp, connPort, connType);
+                // Bind receive event
+                xcmpConn.OnReceive += (sender, data) => { OnReceive?.Invoke(this, data); };
                 // Connect
                 xcmpConn.Connect();
             }
@@ -177,6 +265,8 @@ namespace xcmp.connection
 
         public void Disconnect()
         {
+            Status = XCMPConnectionStatus.DISCONNECTING;
+
             Log.Information("Disconnecting from XCMP");
             // Stop xcmp connection
             if (xcmpConn != null)
@@ -195,9 +285,23 @@ namespace xcmp.connection
                 pppd.WaitForExit();
                 pppd.Dispose();
                 pppd = null;
-                pppdConnected = false;
                 pppdRemoteIp = null;
             }
+            // Send a disconnect
+            if (port != null)
+            {
+                Log.Debug("Hanging up PPP");
+                if (!port.IsOpen)
+                    port.Open();
+                writeLine(port, "ATH");
+                string resp = readLine(port);
+                if (resp != "OK")
+                    Log.Error("Failed to hang up PPP call");
+                port.Close();
+                port = null;
+            }
+
+            Status = XCMPConnectionStatus.DISCONNECTED;
         }
 
         private void pppdData(object sender, DataReceivedEventArgs e)
@@ -216,7 +320,7 @@ namespace xcmp.connection
                         throw new Exception("PPPD connected without obtaining remote IP address!");
 
                     Log.Information("XCMP connected to radio at {0}", pppdRemoteIp);
-                    pppdConnected = true;
+                    Status = XCMPConnectionStatus.CONNECTED;
                 }
             }
         }
@@ -226,17 +330,9 @@ namespace xcmp.connection
             Log.Error("pppd process exited unexpectedly with exit code {0}!", pppd.ExitCode);
             pppd.Dispose();
             pppd = null;
-            pppdConnected = false;
             pppdRemoteIp = null;
-        }
 
-        public byte[] Receive()
-        {
-            if (xcmpConn == null)
-            {
-                throw new InvalidOperationException("XCMP not connected!");
-            }
-            return xcmpConn.Receive();
+            Status = XCMPConnectionStatus.ERROR;
         }
 
         public void Send(byte[] data)

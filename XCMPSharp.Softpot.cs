@@ -82,6 +82,20 @@ namespace xcmp
             {
                 // Stub
             }
+
+            /// <summary>
+            /// Cast a base XCMP message to a Softpot message
+            /// </summary>
+            /// <param name="msg"></param>
+            public SoftpotMessage(XcmpMessage msg) : base(msg.MsgType, msg.Opcode)
+            {
+                // Sanity check
+                if (msg.Opcode != Opcode.SOFTPOT)
+                    throw new ArgumentException($"Cannot cast XCMP message with opcode {Enum.GetName(Opcode)} to a SOFTPOT message!");
+                // Copy things over
+                Result = msg.Result;
+                Data = msg.Data;
+            }
         }
 
         /// <summary>
@@ -156,17 +170,15 @@ namespace xcmp
         /// </summary>
         /// <param name="message"></param>
         /// <returns></returns>
-        public SoftpotMessage SendSoftpot(SoftpotMessage message)
+        public async Task<SoftpotMessage> SendSoftpot(SoftpotMessage message)
         {
-            // Send the softpot message and receive and standard XCMP message
-            XcmpMessage resp = Get(message);
-            // Convert the response to a softpot message by parsing the bytes
-            SoftpotMessage sp_resp = new SoftpotMessage(resp.Bytes);
+            // Send the softpot message and receive one back
+            SoftpotMessage resp = new SoftpotMessage(await Get(message, Opcode.SOFTPOT));
             // Verify that we got the correct type back
-            if (sp_resp.Type != message.Type)
-                throw new Exception($"Received different softpot type from what was sent! (Sent {message.Type} but got {sp_resp.Type})");
+            if (resp.Type != message.Type)
+                throw new Exception($"Received different softpot type from what was sent! (Sent {message.Type} but got {resp.Type})");
             // Return
-            return sp_resp;
+            return resp;
         }
 
         /// <summary>
@@ -174,13 +186,13 @@ namespace xcmp
         /// </summary>
         /// <param name="type">softpot type</param>
         /// <returns>The bytes representing the softpot value (variable length)</returns>
-        public byte[] SoftpotGetValue(SoftpotType type)
+        public async Task<byte[]> SoftpotGetValue(SoftpotType type)
         {
             Log.Debug("XCMP: Getting softpot value for {type}", Enum.GetName(type));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.READ, type);
-
-            return SendSoftpot(msg).Value;
+            
+            return (await SendSoftpot(msg)).Value;
         }
 
         /// <summary>
@@ -189,13 +201,13 @@ namespace xcmp
         /// <param name="type"></param>
         /// <returns></returns>
         /// <exception cref="InvalidDataException"></exception>
-        public byte[] SoftpotGetMinimum(SoftpotType type)
+        public async Task<byte[]> SoftpotGetMinimum(SoftpotType type)
         {
             Log.Debug("XCMP: getting softpot minimum for {type}", Enum.GetName(type));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.READ_MIN, type);
 
-            return SendSoftpot(msg).Value;
+            return (await SendSoftpot(msg)).Value;
         }
 
         /// <summary>
@@ -204,13 +216,13 @@ namespace xcmp
         /// <param name="type"></param>
         /// <returns></returns>
         /// <exception cref="InvalidDataException"></exception>
-        public byte[] SoftpotGetMaximum(SoftpotType type)
+        public async Task<byte[]> SoftpotGetMaximum(SoftpotType type)
         {
             Log.Debug("XCMP: getting softpot maximum for {type}", Enum.GetName(type));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.READ_MAX, type);
 
-            return SendSoftpot(msg).Value;
+            return (await SendSoftpot(msg)).Value;
         }
 
         /// <summary>
@@ -219,14 +231,14 @@ namespace xcmp
         /// <param name="type"></param>
         /// <param name="val"></param>
         /// <exception cref="InvalidDataException"></exception>
-        public void SoftpotWrite(SoftpotType type, byte[] val)
+        public async void SoftpotWrite(SoftpotType type, byte[] val)
         {
             Log.Debug("XCMP: writing softpot {type} -> {val}", Enum.GetName(type), Convert.ToHexString(val));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.WRITE, type);
             msg.Value = val;
 
-            SendSoftpot(msg);
+            await SendSoftpot(msg);
         }
 
         /// <summary>
@@ -234,14 +246,14 @@ namespace xcmp
         /// </summary>
         /// <param name="id"></param>
         /// <param name="val"></param>
-        public void SoftpotUpdate(SoftpotType type, byte[] val)
+        public async void SoftpotUpdate(SoftpotType type, byte[] val)
         {
             Log.Debug("XCMP: updating softpot {type} -> {val}", Enum.GetName(type), Convert.ToHexString(val));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.UPDATE, type);
             msg.Value = val;
 
-            SendSoftpot(msg);
+            await SendSoftpot(msg);
         }
 
         /// <summary>
@@ -251,13 +263,13 @@ namespace xcmp
         /// <param name="byteLen"></param>
         /// <returns></returns>
         /// <exception cref="Exception"></exception>
-        public List<byte[]> SoftpotReadAll(SoftpotType type, int byteLen)
+        public async Task<List<byte[]>> SoftpotReadAll(SoftpotType type, int byteLen)
         {
             Console.Write("XCMP: reading all softpot values for softpot {type} ({len} bytes each", Enum.GetName(type), byteLen);
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.READ_ALL, type);
 
-            SoftpotMessage resp = SendSoftpot(msg);
+            SoftpotMessage resp = await SendSoftpot(msg);
 
             // Validate
             if (resp.Value.Length % byteLen != 0)
@@ -284,13 +296,13 @@ namespace xcmp
         /// </summary>
         /// <param name="type"></param>
         /// <returns></returns>
-        public int[] SoftpotReadAllFrequencies(SoftpotType type)
+        public async Task<int[]> SoftpotReadAllFrequencies(SoftpotType type)
         {
             Log.Debug("XCMP: reading all softpot frequencies for softpot {type}", Enum.GetName(type));
 
             SoftpotMessage msg = new SoftpotMessage(MsgType.REQUEST, SoftpotOperation.READ_ALL_FREQ, type);
 
-            SoftpotMessage resp = SendSoftpot(msg);
+            SoftpotMessage resp = await SendSoftpot(msg);
 
             // Parse the frequencies in the response (freqs are 4 byes each)
             int n_freqs = resp.Data.Length / 4;
@@ -316,7 +328,7 @@ namespace xcmp
         /// </summary>
         /// <param name="nFrames">number of frames to average over for measurement</param>
         /// <returns></returns>
-        public double GetP25BER(int nIntFrames)
+        public async Task<double> GetP25BER(int nIntFrames)
         {
             Log.Debug("XCMP: measuring P25 BER using {nframes} frames of integration", nIntFrames);
 
@@ -345,7 +357,7 @@ namespace xcmp
 
             // Request an RX BER report
             msg = new XcmpMessage(MsgType.REQUEST, Opcode.RX_BER_SYNC_REPORT);
-            XcmpMessage resp = Get(msg);
+            XcmpMessage resp = await Get(msg, Opcode.RX_BER_SYNC_REPORT);
 
             //System.Threading.Thread.Sleep(500);
 
@@ -402,22 +414,22 @@ namespace xcmp
         /// </summary>
         /// <param name="type"></param>
         /// <returns></returns>
-        public SoftpotParams SoftpotGetParams(SoftpotType type)
+        public async Task<SoftpotParams> SoftpotGetParams(SoftpotType type)
         {
             // New struct
             SoftpotParams p = new SoftpotParams();
 
             // Read frequencies
-            p.Frequencies = SoftpotReadAllFrequencies(type);
+            p.Frequencies = await SoftpotReadAllFrequencies(type);
 
             // Get min/max/byte length
-            byte[] min = SoftpotGetMinimum(type);
+            byte[] min = await SoftpotGetMinimum(type);
             p.Min = SoftpotBytesToValue(min);
-            p.Max = SoftpotBytesToValue(SoftpotGetMaximum(type));
+            p.Max = SoftpotBytesToValue(await SoftpotGetMaximum(type));
             p.ByteLength = min.Length;
 
             // Get initial values
-            List<byte[]> vals = SoftpotReadAll(type, p.ByteLength);
+            List<byte[]> vals = await SoftpotReadAll(type, p.ByteLength);
 
             // Validate
             if (vals.Count != p.Frequencies.Length)
