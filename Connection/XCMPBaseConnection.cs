@@ -21,8 +21,8 @@ namespace xcmp.connection
         public event EventHandler<byte[]> OnReceive;
         public int Timeout { get; }
         
-        public void Connect();
-        public void Disconnect();
-        public void Send(byte[] data);
+        public Task Connect();
+        public Task Disconnect();
+        public Task Send(byte[] data);
     }
 }

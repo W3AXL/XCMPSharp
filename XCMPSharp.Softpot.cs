@@ -339,7 +339,7 @@ namespace xcmp
                 (byte)RxBerTestPattern.P25_1011,
                 (byte)RxModulation.C4FM
             };
-            Send(msg);
+            await Send(msg);
 
             Thread.Sleep(500);
 
@@ -350,7 +350,7 @@ namespace xcmp
                 (byte)RxBerTestMode.CONTINUOUS,
                 (byte)nIntFrames
             };
-            Send(msg);
+            await Send(msg);
 
             // Wait for the requested number of frames
             Thread.Sleep(800 * nIntFrames);

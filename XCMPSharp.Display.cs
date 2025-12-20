@@ -5,6 +5,7 @@ using FFmpeg.AutoGen;
 using Microsoft.Extensions.Logging.Abstractions;
 using Org.BouncyCastle.Asn1.X509;
 using Serilog;
+using SIPSorcery.Sys;
 
 namespace xcmp
 {
@@ -361,9 +362,12 @@ namespace xcmp
                     else if (function == DisplayFunction.QUERY)
                         // Query requests include 1 byte in the data field, so 3
                         Data = new byte[3];
+                    else
+                        // Other requests just have a function & token
+                        Data = new byte[2];
                 }
                 else
-                    // All other requests and replies only have the function & token fields
+                    // Replies only have the function & token fields to start with
                     Data = new byte[2];
 
                 // Set function
@@ -382,6 +386,8 @@ namespace xcmp
                 // Ensure that the message type is correct
                 if (Opcode != Opcode.DISPTXT)
                     throw new ArgumentException($"XCMP opcode {Enum.GetName(Opcode)} does not match expected DISPTXT opcode!");
+                // Debug Print
+                logDebugPrint();
             }
 
             /// <summary>
@@ -392,26 +398,61 @@ namespace xcmp
             {
                 // Sanity Check
                 if (msg.Opcode != Opcode.DISPTXT)
-                    throw new ArgumentException($"Cannot cast XCMP message with opcode {Enum.GetName(Opcode)} to a DISPTXT message!");
+                    throw new ArgumentException($"Cannot cast XCMP message with opcode {Enum.GetName(msg.Opcode)} to a DISPTXT message!");
                 // Copy things over
                 Result = msg.Result;
                 Data = msg.Data;
+                // Debug Print
+                logDebugPrint();
+            }
+
+            private void logDebugPrint()
+            {
+                if (MsgType == MsgType.REQUEST)
+                {
+                    string funcName = Enum.GetName(Function ?? DisplayFunction.QUERY);
+                    Log.Debug("DISPTXT Request: Function {func}, Token {token}", (Function != null) ? funcName : "None", Token);
+                }
+                else if (MsgType == MsgType.RESPONSE)
+                {
+                    string funcName = Enum.GetName(Function ?? DisplayFunction.QUERY);
+                    Log.Debug("DISPTXT Response: Result {res}, Function {func}, Token {token}", Enum.GetName(Result), (Function != null) ? funcName : "None", Token);
+                }
+                else if (MsgType == MsgType.BROADCAST)
+                {
+                    Log.Debug("DISPTXT Broadcast:");
+                }
+                if (Function == DisplayFunction.UPDATE || (Function == DisplayFunction.QUERY && Result == Result.SUCCESS) || MsgType == MsgType.BROADCAST)
+                {
+                    Log.Debug(" ┣  Region {region}, Encoding {encoding}, Text Length {len}", Region, TextEncoding, TextCharLength);
+                    Log.Debug(" ┗  Text: {text}", Text.IsNullOrBlank() ? "(empty)" : Text);
+                }
             }
         }
         
-        public async Task<DisplayTextMsg> GetDisplayText(DisplayRegion region, DisplayID id = DisplayID.ALL)
+        /// <summary>
+        /// Request display text from the radio
+        /// </summary>
+        /// <param name="region"></param>
+        /// <param name="id"></param>
+        public async Task QueryDisplayText(DisplayRegion region, DisplayID id = DisplayID.ALL)
         {
             // Prepare query message
             DisplayTextMsg msg = new DisplayTextMsg(MsgType.REQUEST, DisplayFunction.QUERY);
             msg.Region = region;
             msg.ID = id;
 
-            // Send & get response
-            DisplayTextMsg resp = new DisplayTextMsg(await Get(msg, Opcode.DISPTXT));
+            await Send(msg);
+        }
 
-            Log.Debug("Got display {region} (ID {id}) text {text}", Enum.GetName((DisplayRegion)resp.Region), Enum.GetName((DisplayID)resp.ID), resp.Text);
-
-            return resp;
+        /// <summary>
+        /// Request a display text refresh (broadcast of all display's text)
+        /// </summary>
+        public async Task RefreshDisplayText()
+        {
+            // Prepare refresh message
+            DisplayTextMsg msg = new DisplayTextMsg(MsgType.REQUEST, DisplayFunction.REFRESH);
+            await Send(msg);
         }
     }
 }

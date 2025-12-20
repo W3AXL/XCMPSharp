@@ -147,11 +147,15 @@ namespace xcmp
             {
                 get
                 {
-                    return (DeviceType)Data[5];
+                    if (InitType == DeviceInitType.INIT_STATUS || InitType == DeviceInitType.STATUS_UPDATE)
+                        return (DeviceType)Data[5];
+                    else
+                        return DeviceType.UNKNOWN;
                 }
                 set
                 {
-                    Data[5] = (byte)value;
+                    if (InitType == DeviceInitType.INIT_STATUS || InitType == DeviceInitType.STATUS_UPDATE)
+                        Data[5] = (byte)value;
                 }
             }
 
@@ -163,16 +167,20 @@ namespace xcmp
             {
                 get
                 {
-                    return BitConverter.ToUInt16(Data.Skip(6).Take(2).Reverse().ToArray());
+                    if (InitType == DeviceInitType.INIT_STATUS || InitType == DeviceInitType.STATUS_UPDATE)
+                        return BitConverter.ToUInt16(Data.Skip(6).Take(2).Reverse().ToArray());
+                    else
+                        return 0;
                 }
                 set
                 {
-                    Array.Copy(BitConverter.GetBytes((UInt16)value).Reverse().ToArray(), 0, Data, 6, 2);
+                    if (InitType == DeviceInitType.INIT_STATUS || InitType == DeviceInitType.STATUS_UPDATE)
+                        Array.Copy(BitConverter.GetBytes((UInt16)value).Reverse().ToArray(), 0, Data, 6, 2);
                 }
             }
 
             /// <summary>
-            /// Whether the status indicates a fatal error
+            /// Whether the status indicates a fatal error (bit 15 set)
             /// </summary>
             public bool FatalError
             {
@@ -182,27 +190,21 @@ namespace xcmp
                 }
             }
 
-            public List<(DeviceAttribute Attribute, byte Value)> Attributes
+            /// <summary>
+            /// Whether the status indicates a non-fatal error (bit 14 set)
+            /// </summary>
+            public bool NonFatalError
             {
                 get
                 {
-                    // Create the output list
-                    List<(DeviceAttribute, byte)> attributeList = new List<(DeviceAttribute, byte)>();
-                    // Get the attribute byte array
-                    byte[] attribs = Data.Skip(10).ToArray();
-                    // Iterate two bytes at a time
-                    for (int i = 0; i < AttributeLength; i += 2)
-                    {
-                        attributeList.Add(((DeviceAttribute)attribs[i], attribs[i + 1]));
-                    }
-                    return attributeList;
+                    return (DeviceStatus >> 14 & 0x1) == 1;
                 }
             }
 
             /// <summary>
             /// The length of the device descriptor array in bytes
             /// </summary>
-            public byte AttributeLength
+            public byte DescriptorLength
             {
                 get
                 {
@@ -228,26 +230,102 @@ namespace xcmp
                 // Stub
             }
 
+            public DeviceInitStatusMsg(XcmpMessage msg) : base(msg.MsgType, msg.Opcode)
+            {
+                // Sanity Check
+                if (msg.Opcode != Opcode.DEV_INIT_STS)
+                    throw new ArgumentException($"Cannot cast XCMP message with opcode {Enum.GetName(msg.Opcode)} to a DEVINITSTS message!");
+                if (msg.MsgType != MsgType.BROADCAST)
+                    throw new ArgumentException($"DEVINITSTS messages can only be broadcasts! (Got {msg.MsgType})");
+                // Copy
+                Result = msg.Result;
+                Data = msg.Data;
+                // Debug Print
+                logDebugPrint();
+            }
+
+            private void logDebugPrint()
+            {
+                if (MsgType == MsgType.BROADCAST)
+                {
+                    if (InitType == DeviceInitType.INIT_COMPLETE)
+                        Log.Debug("DEVINITSTS: Master indicates init complete (XCMP version {ver})", XcmpVersion);
+                    else
+                        Log.Debug("DEVINITSTS Broadcast: XCMP Verstion {ver}, Init Type {init}, Device Type {dev}, Status {stat:X}, Descriptor Length {size}", XcmpVersion, Enum.GetName(InitType), Enum.GetName(DeviceType), DeviceStatus, DescriptorLength);
+                    // Iterate over any errors
+                    if (FatalError)
+                        Log.Error(" ┗  Fatal error detected! Error code {code:X}", DeviceStatus & 0x7FFF);
+                    else if (NonFatalError)
+                        Log.Warning(" ┗  Non-fatal error detected! Error code {code:X}", DeviceStatus & 0x3FFF);
+                    // Iterate over device descriptors
+                    if (DescriptorLength > 0)
+                    {
+                        List<DeviceAttribute> attribs = GetAttributeList();
+                        attribs.ForEach((attr) =>
+                        {
+                            List<byte> vals = GetAttributeValues(attr);
+                            Log.Debug(" ┗  Attribute {attr}, Values {vals}", Enum.GetName(attr), vals);
+                        });
+                    }
+                    else
+                        Log.Debug(" ┗  No descriptors included in message");
+                } 
+            }
+
+            /// <summary>
+            /// A list of (DeviceAttribute, Value) tuples contained in this status message
+            /// </summary>
+            public List<(DeviceAttribute Attribute, byte Value)> GetAttributes()
+            {
+                if (InitType == DeviceInitType.INIT_STATUS || InitType == DeviceInitType.STATUS_UPDATE)
+                {
+                    // Create the output list
+                    List<(DeviceAttribute, byte)> attributeList = new List<(DeviceAttribute, byte)>();
+                    // Get the attribute byte array
+                    byte[] attrData = Data.Skip(9).ToArray();
+                    // Iterate two bytes at a time
+                    for (int i = 0; i < DescriptorLength; i += 2)
+                    {
+                        attributeList.Add(((DeviceAttribute)attrData[i], attrData[i + 1]));
+                    }
+                    return attributeList;
+                }
+                else
+                    Log.Warning("DEVINITSTS message was not an INIT_STATUS or STATUS_UPDATE, no device attribute list");
+                    return null;
+            }
+
+            /// <summary>
+            /// Get a list of unique attributes for this message
+            /// </summary>
+            /// <returns></returns>
+            public List<DeviceAttribute> GetAttributeList()
+            {
+                List<DeviceAttribute> attribList = new List<DeviceAttribute>();
+                List<(DeviceAttribute Attribute, byte Value)> attribs = GetAttributes();
+                attribs.ForEach((attr) =>
+                {
+                    if (!attribList.Contains(attr.Attribute))
+                        attribList.Add(attr.Attribute);
+                });
+                return attribList;
+            }
+
             /// <summary>
             /// Get a list of values for the specified attribute
             /// </summary>
-            public List<byte> GetAttribute(DeviceAttribute attribute)
+            public List<byte> GetAttributeValues(DeviceAttribute attribute)
             {
                 // Output list
-                List<byte> attribsList = new List<byte>();
-                // Get the attribute byte array
-                byte[] attribs = Data.Skip(10).ToArray();
-                // Iterate two bytes at a time
-                for (int i = 0; i < AttributeLength; i += 2)
+                List<byte> valuesList = new List<byte>();
+                // Iterate over atributes list
+                foreach ((DeviceAttribute Attribute, byte Value) entry in GetAttributes())
                 {
-                    DeviceAttribute attrib = (DeviceAttribute)attribs[i];
-                    if (attrib == attribute)
-                    {
-                        attribsList.Add(attribs[i + 1]);
-                    }
+                    if (entry.Attribute == attribute)
+                        valuesList.Add(entry.Value);
                 }
                 // Return
-                return attribsList;
+                return valuesList;
             }
 
             /// <summary>
@@ -258,7 +336,7 @@ namespace xcmp
             public void AddAttribute(DeviceAttribute attribute, byte value)
             {
                 // Check if this attribute/value pair already exists
-                if (Attributes.Any(attrib => attrib.Attribute == attribute && attrib.Value == value))
+                if (GetAttributes().Any(attrib => attrib.Attribute == attribute && attrib.Value == value))
                 {
                     return;
                 }
@@ -269,7 +347,7 @@ namespace xcmp
                 // Update
                 Data = newData.ToArray();
                 // Update length
-                AttributeLength += 1;
+                DescriptorLength += 2;
             }
         }
     }

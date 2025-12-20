@@ -6,6 +6,7 @@ using System.Linq.Expressions;
 using System.Runtime.Serialization;
 using System.Diagnostics;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 
 namespace xcmp
 {
@@ -23,7 +24,7 @@ namespace xcmp
 
         public XCMPConnectionStatus Status { get { return _connection.Status; } }
 
-        private XcmpMessage lastMessage;
+        private ConcurrentQueue<XcmpMessage> rxHistory = new ConcurrentQueue<XcmpMessage>();
 
         public class XcmpMessage
         {
@@ -112,17 +113,17 @@ namespace xcmp
                 {
                     Result = (Result)data[2];
                     Data = data.Skip(3).ToArray();
-                    Log.Debug("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Result {result:X} ({resultName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Result, Enum.GetName(Result), Convert.ToHexString(Data));
+                    Log.Verbose("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Result {result:X} ({resultName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Result, Enum.GetName(Result), Convert.ToHexString(Data));
                 }
                 else
                 {
                     Data = data.Skip(2).ToArray();
-                    Log.Debug("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Convert.ToHexString(Data));
+                    Log.Verbose("XCMP: Got MsgType {type:X} ({typeName}), Opcode {opcode:X} ({opcodeName}), Data: [{dataHex}]", MsgType, Enum.GetName(MsgType), Opcode, Enum.GetName(Opcode), Convert.ToHexString(Data));
                 }
             }
         }
 
-        public XCMP(XCMPBaseConnection conn, int timeout = 1000)
+        public XCMP(XCMPBaseConnection conn, int timeout = 2000)
         {
             Timeout = timeout;
             _connection = conn;
@@ -194,27 +195,40 @@ namespace xcmp
         /// </summary>
         /// <param name="underTest"></param>
         /// <param name="awaitInit">Wait for DEV_INIT_STS messages on connect</param>
-        public async void Connect(bool underTest = false)
+        public async Task Connect()
         {
-            // Wait for connection to complete
-            _connection.Connect();
-            while (_connection.Status != XCMPConnectionStatus.CONNECTED) { await Task.Delay(2); }
-            // Retrieve serial/model once we're all booted up
-            if (!underTest)
+            // Wait for base connection to complete
+            await _connection.Connect();
+            // Ensure we connected
+            if (_connection.Status != XCMPConnectionStatus.CONNECTED)
             {
-                SerialNumber = await GetSerial();
-                ModelNumber = await GetModel();
-                FirmwareVersion = $"HOST {await GetVersion(VersionOperation.HostSoftware)}, DSP {await GetVersion(VersionOperation.DSPSoftware)}";
-                Log.Debug("XCMP: connected to radio model {ModelNumber} (S/N {SerialNumber}, {FirmwareVersion})", ModelNumber, SerialNumber, FirmwareVersion);
+                throw new TimeoutException($"Failed to establish XCMP connection!");
             }
+            // Wait for a DEVINITSTS from the master
+            XcmpMessage msg = await getMessage(Opcode.DEV_INIT_STS);
+            // Parse
+            DeviceInitStatusMsg devSts = new DeviceInitStatusMsg(msg);
+            // When we receive one from the master, we need to send back our own identifying us as a PC application
+            XCMP.DeviceInitStatusMsg ourSts = new XCMP.DeviceInitStatusMsg(DeviceInitType.INIT_STATUS, devSts.XcmpVersion);
+            // We are a control head
+            ourSts.DeviceType = DeviceType.PC_APPLICATION;
+            // No errors
+            ourSts.DeviceStatus = 0;
+            // We are a generic display device
+            ourSts.AddAttribute(DeviceAttribute.DISPLAY, (byte)DeviceDisplayType.GENERIC);
+            // Send it
+            Log.Debug("Sending DEVINITSTS for XCMP connection to radio");
+            await Send(ourSts);
+            // Finally, we're done!
+            Log.Information("XCMP connection established with radio!");
         }
 
         /// <summary>
         /// Disconnect from the radio
         /// </summary>
-        public void Disconnect()
+        public async Task Disconnect()
         {
-            _connection.Disconnect();
+            await _connection.Disconnect();
             Log.Debug("XCMP: Disconnected from radio, seeya!");
         }
 
@@ -222,27 +236,41 @@ namespace xcmp
         /// Send an XCMP message without expecting a response
         /// </summary>
         /// <param name="message"></param>
-        public void Send(XcmpMessage message)
+        public async Task Send(XcmpMessage message)
         {
-            sendBytes(message.Bytes);
+            await sendBytes(message.Bytes);
         }
 
         /// <summary>
         /// Send a raw byte sequence via the XCMP connection
         /// </summary>
         /// <param name="data"></param>
-        private void sendBytes(byte[] data)
+        private async Task sendBytes(byte[] data)
         {
             if (Status != XCMPConnectionStatus.CONNECTED) { throw new InvalidOperationException("XCMP not connected!"); }
             Log.Verbose("XCMP: >>SENT>> {0}", Convert.ToHexString(data));
-            _connection.Send(data);
+            await _connection.Send(data);
         }
 
+        /// <summary>
+        /// Method for storing a new received message in the history queue and clearing out old ones
+        /// </summary>
+        /// <param name="msg"></param>
+        private void storeRxMessage(XcmpMessage msg)
+        {
+            rxHistory.Enqueue(msg);
+            while (rxHistory.Count > 10 && rxHistory.TryDequeue(out _));
+        }
+
+        /// <summary>
+        /// Internal handler for new XCMP messages received over the connection
+        /// </summary>
+        /// <param name="data"></param>
         private void onReceiveBytes(byte[] data)
         {
             Log.Verbose("XCMP: <<RCV<< {0}", Convert.ToHexString(data));
             XcmpMessage msg = new XcmpMessage(data);
-            lastMessage = msg;
+            storeRxMessage(msg);
             OnReceive?.Invoke(this, msg);
         }
 
@@ -253,13 +281,13 @@ namespace xcmp
         /// <returns></returns>
         private async Task<XcmpMessage> getMessage(Opcode opcode)
         {
-            Stopwatch sw = new Stopwatch();
+            Stopwatch sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < Timeout)
             {
-                if (lastMessage?.Opcode == opcode)
-                {
-                    return lastMessage;
-                }
+                // Try to find a matching message in the queue
+                XcmpMessage msg = rxHistory.FirstOrDefault(m => m.Opcode == opcode, null);
+                if (msg != null)
+                    return msg;
                 // Sleep
                 await Task.Delay(2);
             }
@@ -274,7 +302,7 @@ namespace xcmp
         /// <returns></returns>
         public async Task<XcmpMessage> Get(XcmpMessage msg, Opcode responseOpcode)
         {
-            Send(msg);
+            await Send(msg);
             return await getMessage(responseOpcode);
         }
 
@@ -355,25 +383,25 @@ namespace xcmp
             return bands.ToArray();
         }
 
-        public void EnterServiceMode()
+        public async Task EnterServiceMode()
         {
             Log.Debug("XCMP: entering service mode");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.ENTER_TEST_MODE);
 
-            Send(msg);
+            await Send(msg);
         }
 
-        public void ResetRadio()
+        public async Task ResetRadio()
         {
             Log.Debug("XCMP: resetting radio");
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RADIO_RESET);
 
-            Send(msg);
+            await Send(msg);
         }
 
-        public void SetTXFrequency(int frequency, Bandwidth bandwidth, TxDeviation deviation)
+        public async Task SetTXFrequency(int frequency, Bandwidth bandwidth, TxDeviation deviation)
         {
             Log.Debug("XCMP: setting TX frequency to {frequency} (BW: {bw}, DEV: {dev})", frequency, Enum.GetName(bandwidth), Enum.GetName(deviation));
 
@@ -389,10 +417,10 @@ namespace xcmp
             // Sixth byte is modulation
             msg.Data[5] = (byte)deviation;
 
-            Send(msg);
+            await Send(msg);
         }
 
-        public void SetRXFrequency(int frequency, Bandwidth bandwidth, RxModulation modulation)
+        public async Task SetRXFrequency(int frequency, Bandwidth bandwidth, RxModulation modulation)
         {
             Log.Debug("XCMP: setting RX frequency to {frequency} (BW: {bw}, MOD: {mod})", frequency, Enum.GetName(bandwidth), Enum.GetName(modulation));
 
@@ -408,7 +436,7 @@ namespace xcmp
             // Sixth byte is modulation
             msg.Data[5] = (byte)modulation;
 
-            Send(msg);
+            await Send(msg);
         }
 
         public async Task<bool> Keyup(TxMicrophone microphone = TxMicrophone.ExternalMuted)
@@ -447,34 +475,34 @@ namespace xcmp
                 return true;
         }
 
-        public virtual void SetTransmitPower(TxPowerLevel power)
+        public async Task SetTransmitPower(TxPowerLevel power)
         {
             Log.Debug("XCMP: setting TX power to {pwr}", Enum.GetName(power));
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.TX_POWER_LEVEL_INDEX);
             msg.Data = new byte[1] { (byte)power };
 
-            Send(msg);
+            await Send(msg);
         }
 
-        public void SetTransmitConfig(TxConfig config)
+        public async Task SetTransmitConfig(TxConfig config)
         {
             Log.Debug("XCMP: setting TX config to {config}", Enum.GetName(config));
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.TRANSMIT_CONFIG);
             msg.Data = new byte[1] { (byte)config };
 
-            Send(msg);
+            await Send(msg);
         }
 
-        public void SetReceiveConfig(RxConfig config)
+        public async Task SetReceiveConfig(RxConfig config)
         {
             Log.Debug("XCMP: setting RX config to {config}", Enum.GetName(config));
 
             XcmpMessage msg = new XcmpMessage(MsgType.REQUEST, Opcode.RECEIVE_CONFIG);
             msg.Data = new byte[1] { (byte)config };
 
-            Send(msg);
+            await Send(msg);
         }
 
         public async Task<bool> Ping()

@@ -5,6 +5,8 @@ using System.Net.Sockets;
 using System.Data;
 using FFmpeg.AutoGen;
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using Org.BouncyCastle.Crypto.Generators;
 
 namespace xcmp.connection
 {
@@ -207,7 +209,7 @@ namespace xcmp.connection
             // Debug print
             if (Payload != null)
                 Log.Verbose(
-                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, Payload Length {length}, Payload {payload}",
+                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst:X}, Src Addr {src:X}, Trans ID {trans:X}, Payload Length {length}, Payload {payload}",
                     Enum.GetName(Opcode),
                     Enum.GetName(Protocol),
                     Rollover,
@@ -220,7 +222,7 @@ namespace xcmp.connection
                 );
             else
                 Log.Verbose(
-                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst}, Src Addr {src}, Trans ID {trans}, No Payload",
+                    "Decoded XNL message: Opcode {opcode}, Proto {proto}, Rollover {rollover}, AckReqd {ack}, Dst Addr {dst:X}, Src Addr {src:X}, Trans ID {trans:X}, No Payload",
                     Enum.GetName(Opcode),
                     Enum.GetName(Protocol),
                     Rollover,
@@ -294,9 +296,9 @@ namespace xcmp.connection
         /// </summary>
         private bool ackRequired;
         /// <summary>
-        /// Storage for the last message received by the XNL connection (used for async transactions)
+        /// Storage for the last few messages received by the XNL connection (used for verifying async transactions)
         /// </summary>
-        private XNLMessage lastMessage;
+        private ConcurrentQueue<XNLMessage> rxHistory = new ConcurrentQueue<XNLMessage>();
 
         public XCMPXNLWrapper(XCMPBaseConnection baseConnection, XNLKeys keys, int timeout = 1000)
         {
@@ -309,38 +311,35 @@ namespace xcmp.connection
             conn.OnReceive += receiveHandler;
         }
 
-        public void Connect()
+        public async Task Connect()
         {
             Status = XCMPConnectionStatus.CONNECTING;
             // Start the base connection
-            conn.Connect();
+            await conn.Connect();
             // Query for master
             queryMaster();
-            // The rest of the connection setup is handled 
+            // The rest of the connection setup is handled asynchronously so we just wait
+            Stopwatch sw = Stopwatch.StartNew();
+            while (Status != XCMPConnectionStatus.CONNECTED && sw.ElapsedMilliseconds < 2000)   // XNL typically takes a few seconds to establish
+                await Task.Delay(2);
+            // Ensure we connected
+            if (Status != XCMPConnectionStatus.CONNECTED)
+                throw new TimeoutException("Failed to establish XNL connection!");
         }
 
-        /// <summary>
-        /// Waits for the connection sequence to complete
-        /// </summary>
-        public async void AwaitConnect()
-        {
-            while (Status != XCMPConnectionStatus.CONNECTED)
-                await Task.Delay(10);
-        }
-
-        public void Disconnect()
+        public async Task Disconnect()
         {
             Status = XCMPConnectionStatus.DISCONNECTING;
             // TODO: XNL disconnect
             // Disconnect from the base connection
-            conn.Disconnect();
+            await conn.Disconnect();
             // We're disconnected
             Status = XCMPConnectionStatus.DISCONNECTED;
         }
 
         public void Dispose()
         {
-            Disconnect();
+            Disconnect().GetAwaiter().GetResult();
             conn.Dispose();
         }
 
@@ -349,7 +348,7 @@ namespace xcmp.connection
         /// </summary>
         /// <param name="data">the XCMP message as bytes</param>
         /// <exception cref="InvalidDataException"></exception>
-        public async void Send(byte[] data)
+        public async Task Send(byte[] data)
         {
             // Prepare the XNL_DATA_MSG
             XNLMessage msg = new XNLMessage();
@@ -379,22 +378,47 @@ namespace xcmp.connection
         }
 
         /// <summary>
+        /// Method for storing a new received message into the history queue and clearing out old ones
+        /// </summary>
+        /// <param name="msg"></param>
+        /// <returns></returns>
+        private void storeRxMessage(XNLMessage msg)
+        {
+            rxHistory.Enqueue(msg);
+            while (rxHistory.Count > 10 && rxHistory.TryDequeue(out _));
+        }
+
+        private void dumpRxBuffer()
+        {
+            Log.Debug("XNL RX Message History:");
+            foreach (XNLMessage msg in rxHistory)
+            {
+                Log.Debug(
+                    " ┣  {opcode,-12}: Proto: {proto}, Rollover: {rollover}, TID: {tid,4}, ACK: {ack,5}, srcAddr: {src,2}, dstAddr: {dst,2}, Length: {len}",
+                    Enum.GetName(msg.Opcode), Enum.GetName(msg.Protocol), msg.Rollover, msg.TransactionID, msg.AckNeeded, msg.SrcAddress, msg.DstAddress, msg.Payload?.Length
+                );
+            }
+        }
+
+        /// <summary>
         /// Wait for a response to a message using the message's transaction ID
         /// </summary>
         /// <param name="transactionID"></param>
         /// <returns></returns>
         private async Task<XNLMessage> getResponse(XNLOpcode opcode, UInt16 transactionID)
         {
-            Stopwatch sw = new Stopwatch();
+            Stopwatch sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < Timeout)
             {
-                if (lastMessage?.Opcode == opcode && lastMessage?.TransactionID == transactionID)
-                {
-                    return lastMessage;
-                }
+                // Try to find the matching message in the queue
+                XNLMessage msg = rxHistory.FirstOrDefault(m => m.Opcode == opcode && m.TransactionID == transactionID, null);
+                if (msg != null)
+                    return msg;
                 // Sleep
-                await Task.Delay(2);
+                //await Task.Delay(2);
             }
+            Log.Error("Timed out waiting for response matching opcode {opcode} and TID {tid}", Enum.GetName(opcode), transactionID);
+            dumpRxBuffer();
             throw new TimeoutException($"Timed out waiting for response matching opcode {Enum.GetName(opcode)} and TID {transactionID}");
         }
 
@@ -408,7 +432,7 @@ namespace xcmp.connection
             // Decode
             XNLMessage msg = new XNLMessage(data);
             // Store
-            lastMessage = msg;
+            storeRxMessage(msg);
             // Switch based on message type
             switch (msg.Opcode)
             {
@@ -423,6 +447,9 @@ namespace xcmp.connection
                 // Connection Reply is sent in response to a Connection Request
                 case XNLOpcode.DEVICE_CONN_REPLY:
                     gotConnReply(msg);
+                    break;
+                // Device sysmap broadcast, we do nothing with this right now
+                case XNLOpcode.DEVICE_SYSMAP_BRDCST:
                     break;
                 // XCMP Data Message encapsulates XCMP data from the device
                 case XNLOpcode.DATA_MSG:

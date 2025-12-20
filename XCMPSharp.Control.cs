@@ -47,9 +47,9 @@ namespace xcmp
                 get
                 {
                     if (MsgType == MsgType.BROADCAST)
-                        return Convert.ToUInt16(Data.Take(2).Reverse().ToArray());
+                        return BitConverter.ToUInt16(Data.Take(2).Reverse().ToArray());
                     else
-                        return Convert.ToUInt16(Data.Skip(1).Take(2).Reverse().ToArray());
+                        return BitConverter.ToUInt16(Data.Skip(1).Take(2).Reverse().ToArray());
                 }
                 set
                 {
@@ -67,9 +67,9 @@ namespace xcmp
                 get
                 {
                     if (MsgType == MsgType.BROADCAST)
-                        return Convert.ToUInt16(Data.Skip(2).Take(2).Reverse().ToArray());
+                        return BitConverter.ToUInt16(Data.Skip(2).Take(2).Reverse().ToArray());
                     else
-                        return Convert.ToUInt16(Data.Skip(3).Take(2).Reverse().ToArray());
+                        return BitConverter.ToUInt16(Data.Skip(3).Take(2).Reverse().ToArray());
                 }
                 set
                 {
@@ -86,8 +86,8 @@ namespace xcmp
             {
                 get
                 {
-                    // This field is only valid for broadcasts
-                    if (MsgType == MsgType.BROADCAST)
+                    // This field is only valid for broadcasts that included it
+                    if (MsgType == MsgType.BROADCAST && Data.Length == 5)
                     {
                         return Data[4] == 0x01;   
                     }
@@ -121,15 +121,15 @@ namespace xcmp
                     else
                     {
                         // Return null if we're missing the map
-                        if (Data.Length <= 4)
+                        if (Data.Length <= 6)
                             return null;
                         // Number of zones is the first 2-byte number after function/zone/channel
-                        UInt16 num_zones = Convert.ToUInt16(Data.Skip(5).Take(2).Reverse().ToArray());
+                        UInt16 num_zones = BitConverter.ToUInt16(Data.Skip(5).Take(2).Reverse().ToArray());
                         List<UInt16> map = new List<UInt16>(num_zones);
                         // Iterate over the zone channel counts
                         for (int i = 0; i < num_zones; i++)
                         {
-                            UInt16 num_chans = Convert.ToUInt16(Data.Skip(7 + (2*i)).Take(2).Reverse().ToArray());
+                            UInt16 num_chans = BitConverter.ToUInt16(Data.Skip(7 + (2*i)).Take(2).Reverse().ToArray());
                             map.Add(num_chans);
                         }
                         // Return our list
@@ -159,45 +159,77 @@ namespace xcmp
                 // Ensure the message opcode is correct
                 if (Opcode != Opcode.CHZNSEL)
                     throw new ArgumentException($"XCMP Opcode {Enum.GetName(Opcode)}  does not match expected CHZNSEL opcode!");
+                // Debug Print
+                logDebugPrint();
+            }
 
-                // Extra debug print
-                if (MsgType == MsgType.BROADCAST)
+            /// <summary>
+            /// Cast a base XCMP message to a CHZNSEL message
+            /// </summary>
+            /// <param name="msg"></param>
+            /// <exception cref="ArgumentException"></exception>
+            public ChanZoneSelectMsg(XcmpMessage msg) : base(msg.MsgType, msg.Opcode)
+            {
+                // Sanity check
+                if (msg.Opcode != Opcode.CHZNSEL)
+                    throw new ArgumentException($"Cannog cast XCMP message with opcode {Enum.GetName(msg.Opcode)} to CHZNSEL!");
+                // Copy Data
+                Result = msg.Result;
+                Data = msg.Data;
+                // Debug Print
+                logDebugPrint();
+            }
+
+            /// <summary>
+            /// Extra debug print detailing message
+            /// </summary>
+            private void logDebugPrint()
+            {
+                if (MsgType == MsgType.REQUEST)
                 {
-                    Log.Verbose("CHZNSEL Broadcast: Currently selected Zone {zone} Chan {chan}", ZoneNumber, ChanNumber);
+                    Log.Verbose("CHZNSEL Request: Function {func}, Zone {zone} Chan {chan}", Enum.GetName(Function), ZoneNumber, ChanNumber);
+                }
+                else if (MsgType == MsgType.RESPONSE)
+                {
+                    Log.Verbose("CHZNSEL Response: Result {res}, Function {func}, Zone {zone}, Chan {chan}", Enum.GetName(Result), Enum.GetName(Function), ZoneNumber, ChanNumber);
                     if (ZoneChanMap != null)
                     {
                         List<UInt16> map = ZoneChanMap;
-                        Log.Verbose("    Got Zone/Channel Map:");
+                        Log.Verbose(" ┗  Got Zone/Channel Map:");
                         for (int i = 0; i < map.Count; i++)
                         {
-                            Log.Verbose("    - Zone {n}: {y} Channels", i+1, map[i]);
+                            Log.Verbose("    ┗ Zone {n}: {y} Channels", i+1, map[i]);
                         }
-                    }    
+                    }  
+                }
+                else if (MsgType == MsgType.BROADCAST)
+                {
+                    Log.Verbose("CHZNSEL Broadcast: Currently selected Zone {zone} Chan {chan}, Inhibited {stat}", ZoneNumber, ChanNumber, ChanInhibited);
                 }
             }
 
-            public enum ScanControlFunction : byte
-            {
-                DISABLE = 0x00,
-                ENABLE = 0x01,
-                NUISANCE_DEL = 0x02,
-                NUISCANCE_RESET = 0x03,
-                DYNAMIC_PRIORITY = 0x04,
-                SCAN_LANDED = 0x05,
-                DESIGNATED_TX_MEMBER = 0x06,
-                SCAN_RESUMED = 0x07,
-                STATUS = 0x80
-            }
-
-            public enum ScanControlState : byte
-            {
-                NORMAL_OFF = 0x00,
-                NORMAL_ON = 0x01,
-                VOTE_OFF = 0x02,
-                VOTE_ON = 0x03,
-                NO_LIST = 0xFF
-            }
-
         }
+    }
+
+    public enum ScanControlFunction : byte
+    {
+        DISABLE = 0x00,
+        ENABLE = 0x01,
+        NUISANCE_DEL = 0x02,
+        NUISCANCE_RESET = 0x03,
+        DYNAMIC_PRIORITY = 0x04,
+        SCAN_LANDED = 0x05,
+        DESIGNATED_TX_MEMBER = 0x06,
+        SCAN_RESUMED = 0x07,
+        STATUS = 0x80
+    }
+
+    public enum ScanControlState : byte
+    {
+        NORMAL_OFF = 0x00,
+        NORMAL_ON = 0x01,
+        VOTE_OFF = 0x02,
+        VOTE_ON = 0x03,
+        NO_LIST = 0xFF
     }
 }
